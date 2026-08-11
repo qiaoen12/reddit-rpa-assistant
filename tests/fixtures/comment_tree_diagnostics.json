@@ -1,0 +1,14 @@
+{
+  "deleted_parent": [
+    {"parentPositions": "[]", "commentPosition": "0", "placeholderText": "[deleted]"},
+    {"fullname": "t1_child", "parentPositions": "[0]", "commentPosition": "0"}
+  ],
+  "removed_parent": [
+    {"parentPositions": "[]", "commentPosition": "2", "placeholderText": "[removed]"},
+    {"fullname": "t1_child", "parentPositions": "[2]", "commentPosition": "0"}
+  ],
+  "normal_parent": [
+    {"fullname": "t1_parent", "parentPositions": "[]", "commentPosition": "0"},
+    {"fullname": "t1_child", "parentPositions": "[0]", "commentPosition": "0"}
+  ]
+}

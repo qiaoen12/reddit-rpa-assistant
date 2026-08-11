@@ -1,0 +1,7 @@
+{
+  "name": "com.openai.reddit_rpa",
+  "description": "Reddit RPA local collection host",
+  "path": "__HOST_SCRIPT_PATH__",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://__EXTENSION_ID__/"]
+}

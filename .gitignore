@@ -1,0 +1,27 @@
+# 本地采集集合与运行产物：永远不应进入工具仓库。
+VR-XR/
+raw/
+raw-v2/
+clean/
+translated/
+.reddit-rpa-control/
+
+# Python、Node 与操作系统生成物。
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage/
+*.log
+*.sqlite3
+*.ndjson
+.DS_Store
+
+# 本地冻结区与编辑器状态。
+.frozen/
+.idea/
+.vscode/
+
+# Chrome 打包/调试产物。
+*.crx
+*.zip

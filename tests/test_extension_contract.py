@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+import json
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class ExtensionContractTests(unittest.TestCase):
+    def test_manifest_and_post_storage_boundary_are_local_page_only(self) -> None:
+        manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+        worker = (ROOT / "service-worker.js").read_text(encoding="utf-8")
+        content = (ROOT / "content.js").read_text(encoding="utf-8")
+        model = (ROOT / "reddit-model.js").read_text(encoding="utf-8")
+        self.assertEqual(manifest["manifest_version"], 3)
+        self.assertIn("https://www.reddit.com/*", manifest["host_permissions"])
+        self.assertNotIn("downloads", manifest["permissions"])
+        self.assertIn("nativeMessaging", manifest["permissions"])
+        self.assertIn("batch-queue.js", manifest["content_scripts"][0]["js"])
+        self.assertIn("createWritable", worker)
+        self.assertIn("subreddit_registry.json", worker)
+        self.assertIn("autoRegisterSubreddit", worker)
+        self.assertNotIn("fetch(", worker)
+        self.assertNotIn("fetch(", content)
+        self.assertNotIn("XMLHttpRequest", content)
+        self.assertIn("isContinuationThreadLabel", content)
+        self.assertIn("continue this thread", model)
+        self.assertIn("继续此", model)
+        self.assertIn("postPermalinkForPost", content)
+        self.assertIn("reddit-rpa-store-thread", content)
+        self.assertIn("captures.jsonl", worker)
+        self.assertIn("comments.jsonl", worker)
+        self.assertIn("raw-v2", worker)
+        self.assertIn("reddit-rpa-claim-worker", worker)
+        self.assertIn("worker_token", worker)
+        self.assertIn("cancelled_at", worker)
+        self.assertIn('"unprocessed"', worker)
+        self.assertIn("reddit-rpa-output-root-preflight", worker)
+        self.assertIn("Extension context invalidated", worker)
+        self.assertIn("expectedContentScriptVersion", worker)
+        self.assertIn("injectCurrentContentScript", worker)
+        self.assertIn("verifyWritableOutputRoot", content)
+        self.assertIn("pauseBatchForOutputPermission", content)
+        self.assertIn("sendRuntimeMessage", content)
+        self.assertIn("CONTENT_SCRIPT_CONTROLLER_KEY", content)
+        self.assertIn("snapshot_replaced", worker)
+        self.assertIn("COMMENT_OWNERSHIP_UNVERIFIED", worker)
+        self.assertNotIn("newCommentRecords", worker)
+        self.assertIn("reddit-rpa-store-batch-event", worker)
+        self.assertIn(".reddit-rpa-control", worker)
+        self.assertIn("reddit-rpa-control-poll", content)
+        self.assertIn("runControlledBatch", content)
+        self.assertIn("CONTROL_CHANNEL_UNAVAILABLE", worker)
+        self.assertIn("NATIVE_HOST_NAME", worker)
+        self.assertIn("nativeHostOperation", worker)
+        self.assertIn("cancelOrphanedBatchManifest", worker)
+        self.assertIn("worker_tab_closed", worker)
+        self.assertIn('status: "interrupted"', worker)
+        self.assertIn('status: "unprocessed"', worker)
+        control_commands = content[content.index("async function prepareControlPage"):content.index("function hasBatchIntegrityIssue")]
+        self.assertIn("navigateOrResumeThread", control_commands)
+        self.assertNotIn("location.assign", control_commands)
+        self.assertIn("batch-queue.js", worker)
+        self.assertNotIn("reddit-rpa-write-export", content)
+        post_permalink = content[content.index("function postPermalink("):content.index("function extractPostRecord(")]
+        self.assertNotIn("document.querySelectorAll", post_permalink)
+        self.assertIn("parentFullname", content)
+        self.assertIn("parent_fullname", model)
+
+    def test_data_contract_prohibits_a_reply_record_type(self) -> None:
+        data_contract = (ROOT / "docs" / "DATA_CONTRACT.md").read_text(encoding="utf-8")
+        self.assertIn("`record_type: \"comment\"`", data_contract)
+        self.assertIn("不得成为 `record_type`", data_contract)

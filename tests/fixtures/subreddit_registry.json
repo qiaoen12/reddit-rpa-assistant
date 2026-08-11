@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "collection": {
+    "collectionId": "fixture-collection",
+    "name": "Fixture collection",
+    "kind": "collection",
+    "historicNames": []
+  },
+  "subreddits": [
+    {
+      "subreddit": "VRGaming",
+      "canonicalName": "vrgaming",
+      "slug": "vrgaming",
+      "category": "fixture",
+      "historicNames": [],
+      "status": "active"
+    },
+    {
+      "subreddit": "Mixed_Reality",
+      "canonicalName": "mixed_reality",
+      "slug": "mixed-reality",
+      "category": "fixture",
+      "historicNames": [],
+      "status": "active"
+    }
+  ]
+}

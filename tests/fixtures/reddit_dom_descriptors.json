@@ -1,0 +1,61 @@
+{
+  "listing": {
+    "url": "https://www.reddit.com/r/VRGaming/hot/",
+    "posts": [
+      {
+        "postId": "abc123",
+        "subreddit": "VRGaming",
+        "title": "A listing post",
+        "content": "Visible listing body",
+        "canonicalUrl": "https://www.reddit.com/r/VRGaming/comments/abc123/a_listing_post/",
+        "author": "example_user",
+        "publishedAt": "2026-08-07T12:00:00.000Z"
+      },
+      {
+        "postId": "xyz789",
+        "subreddit": "VRGaming",
+        "title": "A second listing post",
+        "content": "Second visible listing body",
+        "canonicalUrl": "https://www.reddit.com/r/VRGaming/comments/xyz789/a_second_listing_post/",
+        "author": "second_user",
+        "publishedAt": "2026-08-07T12:01:00.000Z"
+      }
+    ]
+  },
+  "thread": {
+    "url": "https://www.reddit.com/r/VRGaming/comments/abc123/a_listing_post/def456/",
+    "post": {
+      "postId": "abc123",
+      "subreddit": "VRGaming",
+      "title": "A listing post",
+      "content": "Full post body",
+      "canonicalUrl": "https://www.reddit.com/r/VRGaming/comments/abc123/a_listing_post/",
+      "author": "poster",
+      "publishedAt": "2026-08-07T12:00:00.000Z"
+    },
+    "comments": [
+      {
+        "commentId": "def456",
+        "postId": "abc123",
+        "parentFullname": "t3_abc123",
+        "depth": 0,
+        "subreddit": "VRGaming",
+        "content": "Top-level comment",
+        "canonicalUrl": "https://www.reddit.com/r/VRGaming/comments/abc123/a_listing_post/def456/",
+        "author": "commenter",
+        "publishedAt": "2026-08-07T12:03:00.000Z"
+      },
+      {
+        "commentId": "ghi789",
+        "postId": "abc123",
+        "parentFullname": "t1_def456",
+        "depth": 1,
+        "subreddit": "VRGaming",
+        "content": "Nested reply from a continuation page",
+        "canonicalUrl": "https://www.reddit.com/r/VRGaming/comments/abc123/a_listing_post/ghi789/",
+        "author": "replier",
+        "publishedAt": "2026-08-07T12:05:00.000Z"
+      }
+    ]
+  }
+}

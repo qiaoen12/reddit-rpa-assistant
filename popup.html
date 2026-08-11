@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reddit 本地采集助手</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header class="topbar">
+        <div class="identity">
+          <h1>Reddit 采集</h1>
+          <p id="pageContext">正在读取当前页面</p>
+        </div>
+        <div class="directory-bar" aria-label="保存目录">
+          <span id="rootStatus" class="status neutral">未设置</span>
+          <button id="chooseOutputRoot" type="button" class="compact-button secondary">选择目录</button>
+          <button id="reconnectOutputRoot" type="button" class="compact-button secondary">恢复授权</button>
+        </div>
+      </header>
+
+      <section class="workflow" aria-label="日常采集流程">
+        <div class="section-heading workflow-heading">
+          <h2>日常采集</h2>
+          <p class="section-copy">同步列表 → 采集帖子与评论，均自动保存</p>
+          <span id="workflowBadge" class="status neutral">等待列表页</span>
+        </div>
+
+        <div id="batchControls" class="batch-controls">
+          <p id="batchProgress">当前没有正在运行的批次。</p>
+          <div class="button-row">
+            <button id="pauseBatch" type="button" class="compact-button secondary">暂停当前批次</button>
+            <button id="resumeBatch" type="button" class="compact-button secondary">继续当前批次</button>
+            <button id="cancelBatch" type="button" class="compact-button danger">结束当前批次</button>
+          </div>
+        </div>
+
+        <ol class="workflow-list">
+          <li class="workflow-step">
+            <span class="step-number" aria-hidden="true">1</span>
+            <div class="step-body">
+              <div class="step-heading">
+                <div>
+                  <h3>同步当前列表</h3>
+                  <p id="listingHint">自动滚动、去重并保存目标帖子。</p>
+                </div>
+                <span id="listingStatus" class="step-state">未完成</span>
+              </div>
+              <button id="runListing" type="button">同步并保存前 25 帖</button>
+            </div>
+          </li>
+          <li class="workflow-step">
+            <span class="step-number" aria-hidden="true">2</span>
+            <div class="step-body">
+              <div class="step-heading">
+                <div>
+                  <h3>采集帖子与评论</h3>
+                  <p id="batchHint">步骤 1 完成后启用；只采集刚同步的这批帖子。</p>
+                </div>
+                <span id="batchStatus" class="step-state">等待步骤 1</span>
+              </div>
+              <button id="startLatestBatch" type="button" disabled>开始采集 25 帖</button>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <section class="activity" aria-label="运行状态">
+        <div class="activity-line">
+          <h2>状态</h2>
+          <span id="resultStatus" class="status neutral">等待操作</span>
+          <output id="result" class="result" aria-live="polite">打开一个 subreddit 列表页后，从步骤 1 开始。</output>
+        </div>
+        <details class="log-details">
+          <summary>查看本次日志</summary>
+          <ul id="activityLog" class="activity-log" aria-live="polite"></ul>
+          <pre id="resultDetails">尚无日志。</pre>
+        </details>
+      </section>
+
+      <details class="advanced" id="advancedSettings">
+        <summary>高级设置 <span>默认值已就绪，通常无需修改</span></summary>
+        <div class="advanced-body">
+          <p>默认按 25 帖采集。修改任一参数后，请重新执行步骤 1；无需单独保存设置。</p>
+          <div class="fields">
+            <label>步数<input id="listingSteps" type="number" min="1" max="100" value="25"></label>
+            <label>目标帖子<input id="targetPostCount" type="number" min="1" max="500" value="25"></label>
+            <label>列表上限<input id="maxPosts" type="number" min="1" max="500" value="25"></label>
+            <label>滚动<input id="scrollPercent" type="number" min="20" max="95" value="85"><span>%</span></label>
+            <label>等待<input id="waitMs" type="number" min="150" max="5000" value="1500"><span>ms</span></label>
+            <label>展开轮数<input id="expansionPasses" type="number" min="1" max="14" value="10"></label>
+          </div>
+        </div>
+      </details>
+
+      <details class="advanced" id="advancedTools">
+        <summary>补采、诊断与目录管理 <span>仅在异常或精确补采时使用</span></summary>
+        <div class="advanced-body advanced-tools">
+          <div class="tool-group">
+            <h3>当前页面</h3>
+            <div class="button-grid">
+              <button id="captureListing" type="button" class="secondary">仅保存当前已加载列表</button>
+              <button id="captureThread" type="button" class="secondary">单独采集当前帖子</button>
+              <button id="syncAndStartBatch" type="button" class="secondary">一键同步后立即采集</button>
+              <button id="probe" type="button" class="secondary">诊断当前页面</button>
+            </div>
+          </div>
+
+          <div class="tool-group">
+            <div class="section-heading">
+              <h3>精确补采历史目标</h3>
+              <span id="targetSummary" class="status neutral">未读取</span>
+            </div>
+            <p>仅在需要挑选历史帖子补采时使用，不影响日常两步流程。</p>
+            <input id="targetFilter" type="search" placeholder="搜索帖子标题或代码" autocomplete="off">
+            <div class="button-grid target-actions">
+              <button id="loadTargets" type="button" class="secondary">读取已保存目标</button>
+              <button id="startBatch" type="button" class="secondary">采集已选目标</button>
+              <button id="selectAllTargets" type="button" class="secondary">全选</button>
+              <button id="selectNoTargets" type="button" class="secondary">全不选</button>
+            </div>
+            <div id="targetList" class="target-list" aria-live="polite"></div>
+          </div>
+
+          <div class="directory-tools">
+            <button id="clearLocal" type="button" class="text-button danger">清空本地任务缓存</button>
+          </div>
+        </div>
+      </details>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

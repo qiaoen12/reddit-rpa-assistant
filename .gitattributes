@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.json text working-tree-encoding=UTF-8
+*.jsonl text working-tree-encoding=UTF-8
+*.md text working-tree-encoding=UTF-8
+*.py text working-tree-encoding=UTF-8
+*.js text working-tree-encoding=UTF-8
+*.mjs text working-tree-encoding=UTF-8
+*.cjs text working-tree-encoding=UTF-8
