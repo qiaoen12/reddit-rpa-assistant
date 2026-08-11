@@ -18,7 +18,7 @@ coverage/
 .DS_Store
 
 # 本地冻结区与编辑器状态。
-.frozen/
+frozen/
 .idea/
 .vscode/
 
