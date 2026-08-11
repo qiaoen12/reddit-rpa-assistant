@@ -43,7 +43,7 @@
 <collection-root>/clean/               # 清洁/分析产物
 <collection-root>/translated/          # 翻译产物
 <collection-root>/.reddit-rpa-control/ # Native Host 控制信箱
-frozen/                                # 可见的本地缓存和元数据冻结区
+tools/frozen/                          # 可见的本地缓存和元数据冻结区（仓库外）
 __pycache__/、*.pyc、.DS_Store          # 生成物
 ```
 
