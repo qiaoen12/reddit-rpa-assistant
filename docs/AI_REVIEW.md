@@ -65,6 +65,10 @@
 - complete_with_reported_count_gap：页面报告计数与已验证数量不一致，必须保留 gap。
 - interrupted：只代表批次中断，不代表未处理目标为空。
 
+对于导航失败，评审者还应确认 `failure_kind` 与 `evidence_source` 成对存在：页面 DOM 中的 Reddit 限流提示可记为 `REDDIT_RATE_LIMIT_PAGE` / `page_dom`；浏览器显示的 `HTTP ERROR 429` 只能记为 `HTTP_429_ERROR_PAGE_OBSERVED` / `tab_metadata`，不能把它表述为已验证的 Reddit 服务端响应；`ERR_BLOCKED_BY_CLIENT` 必须保持为 `CLIENT_BLOCKED`，不能进入限流计数。错误页标题和正文不应进入 manifest 或事件日志。
+
+`retry_unfinished` 只能重建源批次中 `unprocessed` / `interrupted` 的已验证 fullname 与 permalink；评审时应确认新批次写入来源血缘、源 manifest 未被改写，并确认 `verify` 不会因 `interrupted` 仍属历史终态而误报 collection complete。
+
 评审者应特别寻找把 0/0、缺父级、未展开控件或 Reddit 头部计数差异直接映射为 complete 的代码路径。
 
 ## 5. 本地验证

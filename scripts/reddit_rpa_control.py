@@ -25,8 +25,10 @@ OUTPUT_LAYER = "raw"
 REQUEST_SCHEMA = "reddit-rpa-control-request-v1"
 RESPONSE_SCHEMA = "reddit-rpa-control-response-v1"
 COLLECTOR_SCHEMA = "reddit-rpa-collector-v1"
-COMMANDS = {"prepare", "run", "pause", "resume", "cancel"}
+COMMANDS = {"prepare", "run", "retry_unfinished", "pause", "resume", "cancel"}
 TERMINAL_STATUSES = {"complete", "tree_partial", "manual", "failed", "interrupted"}
+OPEN_TARGET_STATUSES = {"queued", "running", "unprocessed"}
+RECOVERY_TARGET_STATUSES = {"unprocessed", "interrupted"}
 COLLECTOR_HEARTBEAT_MAX_AGE_SECONDS = 90
 
 
@@ -112,7 +114,7 @@ def valid_collector_id(collector_id: str | None) -> bool:
     return valid_batch_id(str(collector_id or ""))
 
 
-def make_request(command: str, *, subreddit: str | None = None, count: int | None = None, batch_id: str | None = None, collector_id: str | None = None) -> dict[str, Any]:
+def make_request(command: str, *, subreddit: str | None = None, count: int | None = None, batch_id: str | None = None, source_batch_id: str | None = None, collector_id: str | None = None, skip_existing: bool | None = None) -> dict[str, Any]:
     if command not in COMMANDS:
         raise ControlError(f"不支持的控制命令：{command}")
     request: dict[str, Any] = {
@@ -127,8 +129,12 @@ def make_request(command: str, *, subreddit: str | None = None, count: int | Non
         request["count"] = count
     if batch_id is not None:
         request["batch_id"] = batch_id
+    if source_batch_id is not None:
+        request["source_batch_id"] = source_batch_id
     if collector_id is not None:
         request["collector_id"] = collector_id
+    if skip_existing is not None:
+        request["skip_existing"] = skip_existing
     return request
 
 
@@ -143,17 +149,25 @@ def validate_request(root: Path, request: dict[str, Any]) -> dict[str, Any]:
         raise ControlError("request_id 无效。")
     if request.get("collector_id") is not None and not valid_collector_id(str(request.get("collector_id"))):
         raise ControlError("collector_id 无效。")
-    if command in {"prepare", "run"}:
+    if command in {"prepare", "run", "retry_unfinished"}:
         entry = registered_subreddit(root, str(request.get("subreddit") or ""))
         request["subreddit"] = entry["subreddit"]
     if command == "run":
         count = request.get("count")
         if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 50:
             raise ControlError("count 必须是 1 到 50 之间的整数。")
+        skip_existing = request.get("skip_existing", False)
+        if not isinstance(skip_existing, bool):
+            raise ControlError("skip_existing 必须是布尔值。")
+        request["skip_existing"] = skip_existing
     if command in {"pause", "resume", "cancel"}:
         batch_id = str(request.get("batch_id") or "")
         if not valid_batch_id(batch_id):
             raise ControlError("batch_id 无效。")
+    if command == "retry_unfinished":
+        source_batch_id = str(request.get("source_batch_id") or "")
+        if not valid_batch_id(source_batch_id):
+            raise ControlError("source_batch_id 无效。")
     return request
 
 
@@ -327,13 +341,32 @@ def verify_batch(root: Path, batch_id: str) -> dict[str, Any]:
                 if captures and int(captures[-1].get("comment_count_gap") or 0) > 0:
                     gap_count += 1
     selected_count = int(batch.get("selected_count") or 0)
+    status_counts: dict[str, int] = {}
+    for target in targets:
+        status = str(target.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    open_target_count = sum(count for status, count in status_counts.items() if status in OPEN_TARGET_STATUSES)
+    recovery_target_count = sum(count for status, count in status_counts.items() if status in RECOVERY_TARGET_STATUSES)
+    manual_review_target_count = status_counts.get("manual", 0) + status_counts.get("failed", 0)
+    tree_partial_target_count = status_counts.get("tree_partial", 0)
+    structural_integrity_ok = not duplicate_ids and not self_parent_count and not mismatched_post_count
+    collection_complete = open_target_count == 0 and recovery_target_count == 0 and manual_review_target_count == 0
     result = {
-        "ok": selected_count == len(terminal) and not duplicate_ids and not self_parent_count and not mismatched_post_count,
+        "ok": structural_integrity_ok and collection_complete,
         "status": "batch_verified",
         "batch_id": batch.get("batch_id"),
         "selected_count": selected_count,
         "terminal_target_count": len(terminal),
+        "all_targets_terminal": selected_count == len(terminal),
+        "target_status_counts": status_counts,
         "unresolved_target_count": len(targets) - len(terminal),
+        "open_target_count": open_target_count,
+        "recovery_target_count": recovery_target_count,
+        "manual_review_target_count": manual_review_target_count,
+        "tree_partial_target_count": tree_partial_target_count,
+        "collection_complete": collection_complete,
+        "quality_complete": tree_partial_target_count == 0,
+        "structural_integrity_ok": structural_integrity_ok,
         "post_directory_count": post_directory_count,
         "checked_comment_count": comment_count,
         "duplicate_comment_count": len(duplicate_ids),
@@ -374,7 +407,7 @@ def command_result(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "run":
         entry = registered_subreddit(root, args.subreddit)
         started = time.time()
-        response = submit_request(root, make_request("run", subreddit=entry["subreddit"], count=args.count, collector_id=args.collector_id), timeout_seconds=args.timeout)
+        response = submit_request(root, make_request("run", subreddit=entry["subreddit"], count=args.count, collector_id=args.collector_id, skip_existing=args.skip_existing), timeout_seconds=args.timeout)
         if not response.get("ok"):
             return response
         if response.get("status") == "control_preparing":
@@ -382,6 +415,30 @@ def command_result(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             if batch:
                 return {"ok": True, "status": "batch_started", "control": response, "batch": batch}
             return {"ok": False, "code": "CONTROL_BATCH_NOT_STARTED", "error": "工作页已导航，但还没有发现新的 batch.json。", "control": response}
+        return response
+
+    if args.command == "retry_unfinished":
+        source_batch_id = str(args.source_batch_id or "")
+        source = read_json(batch_path(root, source_batch_id))
+        entry = registered_subreddit(root, str(source.get("subreddit") or ""))
+        started = time.time()
+        response = submit_request(
+            root,
+            make_request(
+                "retry_unfinished",
+                subreddit=entry["subreddit"],
+                source_batch_id=source_batch_id,
+                collector_id=args.collector_id,
+            ),
+            timeout_seconds=args.timeout,
+        )
+        if not response.get("ok"):
+            return response
+        if response.get("status") == "recovery_preparing":
+            batch = wait_for_started_batch(root, entry["subreddit"], started, args.timeout)
+            if batch:
+                return {"ok": True, "status": "recovery_batch_started", "control": response, "batch": batch}
+            return {"ok": False, "code": "RECOVERY_BATCH_NOT_STARTED", "error": "工作页已导航，但还没有发现新的恢复批次。", "control": response}
         return response
 
     if args.command == "prepare":
@@ -403,6 +460,10 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--subreddit", required=True)
         if name == "run":
             command.add_argument("--count", type=int, default=25)
+            command.add_argument("--skip-existing", action="store_true", help="仅将当前 /new/ 列表中未出现在 raw/ 的 t3_* 入队；默认仍允许重采已有帖子。")
+    recovery = subparsers.add_parser("retry-unfinished", help="从已取消/中断批次精确重建 unprocessed 与 interrupted 目标，不扫描当前 /new/。")
+    recovery.set_defaults(command="retry_unfinished")
+    recovery.add_argument("--batch", dest="source_batch_id", required=True)
     subparsers.add_parser("health")
     for name in ("pause", "resume", "cancel", "status", "tail", "verify"):
         command = subparsers.add_parser(name)

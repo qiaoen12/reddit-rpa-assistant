@@ -47,10 +47,11 @@ test("background alarm claims a Native Host command and reuses the sole Reddit w
           status: "control_request_pending",
           request: {
             request_id: "request-1",
-            command: "prepare",
+            command: "run",
             collector_id: message.payload.collector_id,
             subreddit: "ValveIndex",
-            count: null,
+            count: 5,
+            skip_existing: true,
             batch_id: null
           },
           validation_error: null
@@ -79,14 +80,14 @@ test("background alarm claims a Native Host command and reuses the sole Reddit w
       },
       sendMessage: async (tabId, message) => {
         sent.push({ tabId, message });
-        if (message.command === "status") return { version: "0.8.0" };
+        if (message.command === "status") return { version: "0.8.2" };
         return { ok: true, status: "control_preparing", subreddit: message.subreddit };
       }
     },
     scripting: { executeScript: async () => undefined },
     alarms: { create() {}, onAlarm },
     runtime: {
-      getManifest: () => ({ version: "0.8.0" }),
+      getManifest: () => ({ version: "0.8.2" }),
       onMessage,
       onInstalled,
       onStartup,
@@ -103,7 +104,7 @@ test("background alarm claims a Native Host command and reuses the sole Reddit w
   assert.equal(response.result.status, "control_preparing");
   assert.deepEqual(sent, [
     { tabId: 19, message: { command: "status" } },
-    { tabId: 19, message: { command: "prepareControlPage", subreddit: "ValveIndex" } }
+    { tabId: 19, message: { command: "runControlledBatch", subreddit: "ValveIndex", count: 5, skip_existing: true } }
   ]);
   assert.equal(tabs.length, 1, "the known sole Reddit tab is reused instead of opening another one");
   assert.equal(nativeOperations.find((operation) => operation.operation === "next_control_request").payload.collector_id, response.request.collector_id);

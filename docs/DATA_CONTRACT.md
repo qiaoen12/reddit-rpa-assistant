@@ -106,6 +106,29 @@ raw/batches/<batch-id>.json 固定本次目标 Post 的 t3_... 身份；批次�
 
 控制请求不应包含正文、Cookie、账号、截图或浏览器令牌。状态读取是只读的；cancel 只标记尚未执行的目标，不删除现有数据。
 
+`run` 可选 `skip_existing: true`。启用后，扩展只读当前 subreddit 的 `raw/<slug>/*/post.json`，以其中的 `t3_*` 与当前 `/new/` 列表做差集；`count` 表示希望入队的未见帖子数，而不是前 `count` 个列表项。最多检查 500 个候选，且仅 `sync_posts` 本次实际新建目录的帖子可进入批次。`frozen/` 永远不参与这项判断。没有未见帖子时返回 `no_unseen_posts`，不创建空 `batch.json`。该选项默认关闭，正常重采仍可覆盖最新评论快照。
+
+`retry_unfinished` 是不同的精确恢复命令。它必须提供 `source_batch_id`，只读取源 `raw/batches/<id>.json` 中状态为 `unprocessed` 或 `interrupted` 的目标；每个目标仍须同时通过 t3 fullname、Reddit permalink、subreddit 和 Post ID 一致性校验。新批次的 `selection_mode` 为 `unfinished_from_batch`，`recovery` 保存源批次 ID、源状态集合和目标数。源清单只读，不会被补采操作改写；`manual`、`failed` 和 `tree_partial` 不属于该自动恢复集合。
+
+### 5.1 导航失败审计
+
+每次批量帖子导航都有唯一 `navigation_id` 和后台租约。租约在 `page_ready`、保存、受控重试、暂停、取消或失败事件后结束；若内容脚本无法在导航页加载，后台仍可通过标签页元数据或 watchdog 写入终态，避免批次无事件悬挂。
+
+`raw/batches/<batch-id>.events.jsonl` 可在现有字段之外写入以下可选字段：
+
+| 字段 | 语义 |
+| --- | --- |
+| `navigation_id` | 关联一次目标帖子导航的安全标识 |
+| `failure_kind` | `HTTP_429_ERROR_PAGE_OBSERVED`、`REDDIT_RATE_LIMIT_PAGE`、`CLIENT_BLOCKED`、`NAVIGATION_ERROR_PAGE` 或 `PAGE_NAVIGATION_TIMEOUT` |
+| `evidence_source` | `page_dom`、`tab_metadata` 或 `background_watchdog` |
+| `displayed_http_status` | 可观察到的页面状态码；未观察到时为 `null` |
+
+批次清单可在顶层写入 `navigation_failure`，目标摘要可写入 `navigation_failures` 和 `last_failure`。`HTTP_429_ERROR_PAGE_OBSERVED` 的含义仅是浏览器工作页显示过 `HTTP ERROR 429`；它不证明响应一定由 Reddit 服务端产生。`CLIENT_BLOCKED` 同样不能计为限流。错误页标题、正文、账号信息和 Cookie 不是审计字段，不能写入事件或 manifest。
+
+### 5.2 验证语义
+
+`verify` 同时返回结构与采集完成度：`structural_integrity_ok` 检查跨帖重复、自指父级、错帖和最新捕获数量差；`collection_complete` 仅在没有 `queued`、`running`、`unprocessed`、`interrupted`、`manual` 或 `failed` 目标时为真；`quality_complete` 还要求没有 `tree_partial`。因此 `interrupted` 可作为历史终态保留，但不能使 `ok` 或 `collection_complete` 为真；`recovery_target_count` 列出可被精确补采的 `unprocessed` / `interrupted` 数量。
+
 ## 6. 不可变性与血缘
 
 清洁、翻译、汇总和质量队列必须保留：

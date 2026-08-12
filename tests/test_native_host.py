@@ -56,7 +56,7 @@ class NativeHostTests(unittest.TestCase):
     def test_claims_one_targeted_control_request_and_preserves_structured_error_responses(self) -> None:
         collector_id = "collector-p8"
         heartbeat = self.store.handle("write_collector_heartbeat", {
-            "collector_id": collector_id, "version": "0.8.0", "state": "ready",
+            "collector_id": collector_id, "version": "0.8.2", "state": "ready",
             "work_tab_id": 19, "work_url": "https://www.reddit.com/r/SteamVR/new/",
         })
         request_path = self.root / HOST.CONTROL_DIRECTORY / "requests" / "request-1.json"
@@ -78,6 +78,64 @@ class NativeHostTests(unittest.TestCase):
         self.assertEqual(json.loads(response_path.read_text(encoding="utf-8"))["code"], "WORK_PAGE_REQUIRED")
         self.assertFalse((self.root / HOST.CONTROL_DIRECTORY / "claims" / "request-1.json").exists())
 
+    def test_control_run_preserves_skip_existing_and_rejects_non_boolean_values(self) -> None:
+        request = {
+            "schema": HOST.REQUEST_SCHEMA,
+            "request_id": "request-supplement",
+            "command": "run",
+            "created_at": "2026-08-11T00:00:00.000Z",
+            "collector_id": "collector-p8",
+            "subreddit": "SteamVR",
+            "count": 5,
+            "skip_existing": True,
+        }
+
+        normalised = self.store.control_request(request)
+
+        self.assertTrue(normalised["skip_existing"])
+        with self.assertRaises(HOST.HostError) as raised:
+            self.store.control_request({**request, "request_id": "request-invalid", "skip_existing": "true"})
+        self.assertEqual(raised.exception.code, "CONTROL_SKIP_EXISTING_INVALID")
+
+    def test_loads_only_exact_unprocessed_and_interrupted_targets_for_recovery(self) -> None:
+        source_batch_id = "2026-08-12_010000_001"
+        source = {
+            "schema": "reddit-rpa-batch-v1",
+            "batch_id": source_batch_id,
+            "subreddit": "SteamVR",
+            "config": {"waitMs": 1500},
+            "targets": [
+                {"fullname": "t3_abc123", "title": "Queued", "permalink": "https://www.reddit.com/r/SteamVR/comments/abc123/queued/", "status": "unprocessed"},
+                {"fullname": "t3_def456", "title": "Interrupted", "permalink": "https://www.reddit.com/r/SteamVR/comments/def456/interrupted/", "status": "interrupted"},
+                {"fullname": "t3_ghi789", "title": "Done", "permalink": "https://www.reddit.com/r/SteamVR/comments/ghi789/done/", "status": "complete"},
+            ],
+        }
+        batches = self.root / "raw" / "batches"
+        batches.mkdir()
+        (batches / f"{source_batch_id}.json").write_text(json.dumps(source), encoding="utf-8")
+
+        recovered = self.store.handle("load_recovery_targets", {"source_batch_id": source_batch_id})
+
+        self.assertTrue(recovered["ok"])
+        self.assertEqual(recovered["recovery_count"], 2)
+        self.assertEqual([target["post"]["fullname"] for target in recovered["targets"]], ["t3_abc123", "t3_def456"])
+        self.assertEqual(recovered["targets"][0]["recovery_source_status"], "unprocessed")
+        self.assertEqual(recovered["config"], {"waitMs": 1500})
+
+    def test_preserves_navigation_failure_evidence_without_raw_tab_text(self) -> None:
+        event = self.store.handle("store_batch_event", {"event": {
+            "schema": "reddit-rpa-batch-event-v1", "batch_id": "2026-08-12_010000_002", "seq": 1,
+            "event": "navigation_error_observed", "post_fullname": "t3_abc123",
+            "navigation_id": "nav-1", "failure_kind": "HTTP_429_ERROR_PAGE_OBSERVED",
+            "evidence_source": "tab_metadata", "displayed_http_status": 429,
+        }})
+
+        stored = event["event"]
+        self.assertEqual(stored["failure_kind"], "HTTP_429_ERROR_PAGE_OBSERVED")
+        self.assertEqual(stored["evidence_source"], "tab_metadata")
+        self.assertEqual(stored["displayed_http_status"], 429)
+        self.assertNotIn("title", stored)
+
     def test_lists_only_active_raw_posts(self) -> None:
         self.store.handle("sync_posts", {"context": self.context, "records": [self.post], "capturedAt": "2026-08-11T00:00:00.000Z"})
         frozen = self.root / "frozen" / "raw-v1-2026-08-11" / "steamvr" / "def456--frozen"
@@ -87,9 +145,11 @@ class NativeHostTests(unittest.TestCase):
         }}), encoding="utf-8")
 
         known = self.store.handle("list_known_posts", {"context": self.context})
+        known_fullnames = self.store.handle("list_known_post_fullnames", {"context": self.context})
 
         self.assertEqual([item["post"]["fullname"] for item in known["posts"]], ["t3_abc123"])
         self.assertEqual([item["layer"] for item in known["posts"]], ["raw"])
+        self.assertEqual(known_fullnames["post_fullnames"], ["t3_abc123"])
 
     def test_rejects_unlisted_native_operations(self) -> None:
         with self.assertRaises(HOST.HostError) as raised:

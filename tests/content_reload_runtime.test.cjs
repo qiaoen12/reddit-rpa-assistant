@@ -8,6 +8,7 @@ const root = path.join(__dirname, "..");
 const selectorsSource = readFileSync(path.join(root, "reddit-dom-selectors.js"), "utf8");
 const modelSource = readFileSync(path.join(root, "reddit-model.js"), "utf8");
 const queueSource = readFileSync(path.join(root, "batch-queue.js"), "utf8");
+const listingSelectionSource = readFileSync(path.join(root, "listing-selection.js"), "utf8");
 const contentSource = readFileSync(path.join(root, "content.js"), "utf8");
 
 function createPageRuntime({ storageGetError = null } = {}) {
@@ -66,6 +67,7 @@ function injectCurrentScripts(runtime) {
   vm.runInNewContext(selectorsSource, runtime.sandbox, { filename: "reddit-dom-selectors.js" });
   vm.runInNewContext(modelSource, runtime.sandbox, { filename: "reddit-model.js" });
   vm.runInNewContext(queueSource, runtime.sandbox, { filename: "batch-queue.js" });
+  vm.runInNewContext(listingSelectionSource, runtime.sandbox, { filename: "listing-selection.js" });
   vm.runInNewContext(contentSource, runtime.sandbox, { filename: "content.js" });
 }
 
@@ -80,7 +82,7 @@ test("takes over a page whose old extension script left the legacy loaded flag b
   injectCurrentScripts(runtime);
   await flushMicrotasks();
 
-  assert.equal(runtime.sandbox.__redditRpaContentScriptLoaded, "0.8.0");
+  assert.equal(runtime.sandbox.__redditRpaContentScriptLoaded, "0.8.2");
   assert.equal(runtime.listeners.size, 1, "the current script must install a usable command listener");
   assert.equal(runtime.timers.size, 3, "the current script should retain its watcher, hydration timer and control poller");
 

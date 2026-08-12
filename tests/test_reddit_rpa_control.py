@@ -16,6 +16,7 @@ from reddit_rpa_control import (  # noqa: E402
     batch_status,
     control_health,
     make_request,
+    parser,
     submit_request,
     tail_events,
     validate_request,
@@ -97,6 +98,36 @@ class RedditRpaControlTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             validate_request(self.root, make_request("run", subreddit="SteamVR", count=51))
 
+    def test_run_request_accepts_only_an_explicit_boolean_skip_existing_flag(self) -> None:
+        request = validate_request(self.root, make_request("run", subreddit="SteamVR", count=5, skip_existing=True))
+
+        self.assertTrue(request["skip_existing"])
+        self.assertFalse(validate_request(self.root, make_request("run", subreddit="SteamVR", count=5))["skip_existing"])
+        with self.assertRaises(ControlError):
+            validate_request(self.root, make_request("run", subreddit="SteamVR", count=5, skip_existing="true"))
+
+    def test_cli_parses_the_documented_supplement_run_syntax(self) -> None:
+        args = parser().parse_args([
+            "--root", str(self.root), "--timeout", "60", "run",
+            "--subreddit", "SteamVR", "--count", "25", "--skip-existing",
+        ])
+
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.root, self.root)
+        self.assertEqual(args.timeout, 60)
+        self.assertEqual(args.subreddit, "SteamVR")
+        self.assertEqual(args.count, 25)
+        self.assertTrue(args.skip_existing)
+
+    def test_cli_parses_exact_unfinished_recovery_syntax(self) -> None:
+        args = parser().parse_args([
+            "--root", str(self.root), "--timeout", "60", "retry-unfinished",
+            "--batch", "2026-08-12_010000_001",
+        ])
+
+        self.assertEqual(args.command, "retry_unfinished")
+        self.assertEqual(args.source_batch_id, "2026-08-12_010000_001")
+
     def test_read_only_status_tail_and_verify_report_integrity_issues(self) -> None:
         batch_id = self.write_batch([
             {"fullname": "t3_a", "status": "complete"},
@@ -123,6 +154,20 @@ class RedditRpaControlTests(unittest.TestCase):
         self.assertEqual(verification["latest_capture_gap_count"], 1)
         self.assertEqual(events["event_count"], 1)
 
+    def test_verify_separates_structural_integrity_from_recovery_need(self) -> None:
+        batch_id = self.write_batch([
+            {"fullname": "t3_a", "status": "complete"},
+            {"fullname": "t3_b", "status": "interrupted"},
+        ])
+
+        verification = verify_batch(self.root, batch_id)
+
+        self.assertTrue(verification["structural_integrity_ok"])
+        self.assertFalse(verification["ok"], "an interrupted target must not look collection-complete")
+        self.assertTrue(verification["all_targets_terminal"], "interrupted remains terminal for historical audit")
+        self.assertEqual(verification["recovery_target_count"], 1)
+        self.assertFalse(verification["collection_complete"])
+
     def test_mcp_exposes_tools_and_reuses_the_read_only_status_path(self) -> None:
         batch_id = self.write_batch([{"fullname": "t3_a", "status": "complete"}])
         listed = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
@@ -135,3 +180,15 @@ class RedditRpaControlTests(unittest.TestCase):
         self.assertEqual(listed["result"]["tools"][0]["name"], "reddit_rpa_health")
         self.assertTrue(called["result"]["structuredContent"]["ok"])
         self.assertEqual(called["result"]["structuredContent"]["batch_id"], batch_id)
+
+    def test_mcp_run_exposes_skip_existing(self) -> None:
+        listed = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        run_tool = next(item for item in listed["result"]["tools"] if item["name"] == "reddit_rpa_run")
+
+        self.assertEqual(run_tool["inputSchema"]["properties"]["skip_existing"]["type"], "boolean")
+
+    def test_mcp_exposes_exact_unfinished_recovery(self) -> None:
+        listed = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        recovery_tool = next(item for item in listed["result"]["tools"] if item["name"] == "reddit_rpa_retry_unfinished")
+
+        self.assertEqual(recovery_tool["inputSchema"]["required"], ["source_batch_id"])

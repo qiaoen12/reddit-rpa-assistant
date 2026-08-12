@@ -29,10 +29,10 @@ async function createServiceWorkerRuntime(initialLock = null) {
     },
     tabs: {
       onRemoved: { addListener() {} },
-      sendMessage: async () => ({ version: "0.8.0" })
+      sendMessage: async () => ({ version: "0.8.2" })
     },
     runtime: {
-      getManifest: () => ({ version: "0.8.0" }),
+      getManifest: () => ({ version: "0.8.2" }),
       onMessage: {
         addListener(listener) { messageListener = listener; }
       }

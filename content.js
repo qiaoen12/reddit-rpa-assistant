@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = "0.8.0";
+  const CONTENT_SCRIPT_VERSION = "0.8.2";
   const CONTENT_SCRIPT_CONTROLLER_KEY = "__redditRpaContentScriptController";
   // 扩展重载会让旧内容脚本的 chrome.runtime 失效，但页面的 isolated
   // world 仍可能保留旧全局变量。新脚本必须接管，而不能被旧布尔标记拦住。
@@ -16,6 +16,7 @@
   const NAVIGATION_DISPATCH_DELAY_MS = 250;
   const CONTROL_POLL_INTERVAL_MS = 1000;
   const RATE_LIMIT_PAGE_TEXT = /(?:you(?:'|’)ve been doing that a lot|whoa there, pardner|too many requests|rate limit(?:ed)?|try again later)/iu;
+  const HTTP_429_PAGE_TEXT = /\bHTTP\s+ERROR\s+429\b/iu;
   const DEFAULT_CONFIG = {
     listingSteps: 25,
     targetPostCount: 25,
@@ -25,12 +26,14 @@
     expansionPasses: 10,
     navigationJitterMs: 750,
     progressTimeoutMs: 45000,
+    navigationTimeoutMs: 60000,
     rateLimitCooldownMs: 60000
   };
   const model = globalThis.RedditRpaModel;
   const selectors = globalThis.RedditRpaDomSelectors;
   const batchQueue = globalThis.RedditRpaBatchQueue;
-  if (!model || !selectors || !batchQueue) {
+  const listingSelection = globalThis.RedditRpaListingSelection;
+  if (!model || !selectors || !batchQueue || !listingSelection) {
     console.error("Reddit RPA 页面采集依赖未加载。");
     return;
   }
@@ -41,6 +44,7 @@
     activeThreadJob: null,
     activeBatchJob: null,
     pendingControlRun: null,
+    pendingRecoveryRun: null,
     lastResult: null,
     version: CONTENT_SCRIPT_VERSION
   };
@@ -146,6 +150,11 @@
     return Math.max(15000, Math.min(120000, Number.isFinite(requested) ? requested : DEFAULT_CONFIG.progressTimeoutMs));
   }
 
+  function navigationLeaseTimeout(config = {}) {
+    const requested = Number(config.navigationTimeoutMs ?? config.progressTimeoutMs);
+    return Math.max(30000, Math.min(300000, Number.isFinite(requested) ? requested : DEFAULT_CONFIG.navigationTimeoutMs));
+  }
+
   function clearThreadProgressWatchdog() {
     if (threadProgressWatchdog) window.clearTimeout(threadProgressWatchdog);
     threadProgressWatchdog = null;
@@ -171,6 +180,12 @@
   function timestampLabel(value = new Date()) {
     const pad = (number, size = 2) => String(number).padStart(size, "0");
     return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}_${pad(value.getHours())}${pad(value.getMinutes())}${pad(value.getSeconds())}_${pad(value.getMilliseconds(), 3)}`;
+  }
+
+  function navigationId() {
+    const suffix = globalThis.crypto?.randomUUID?.().replace(/-/g, "").slice(0, 10)
+      || Math.random().toString(36).slice(2, 12);
+    return `nav-${timestampLabel()}-${suffix}`;
   }
 
   function normalisedPageUrl(value = location.href) {
@@ -285,6 +300,7 @@
         state.activeThreadJob = saved.activeThreadJob || null;
         state.activeBatchJob = saved.activeBatchJob || null;
         state.pendingControlRun = saved.pendingControlRun || null;
+        state.pendingRecoveryRun = saved.pendingRecoveryRun || null;
         state.lastResult = saved.lastResult || null;
       }
       hasHydrated = true;
@@ -325,9 +341,14 @@
     try {
       const context = currentContext();
       const pending = state.pendingControlRun;
+      const pendingRecovery = state.pendingRecoveryRun;
       if (pending && !state.activeBatchJob?.active && context.page_type === "listing"
         && context.subreddit?.toLowerCase() === String(pending.subreddit || "").toLowerCase()) {
         return await runControlledBatch(pending);
+      }
+      if (pendingRecovery && !state.activeBatchJob?.active && context.page_type === "listing"
+        && context.subreddit?.toLowerCase() === String(pendingRecovery.subreddit || "").toLowerCase()) {
+        return await retryUnfinishedBatch(pendingRecovery);
       }
       if (state.activeBatchJob?.active) {
         const worker = await batchWorkerStatus();
@@ -384,6 +405,7 @@
         activeThreadJob: state.activeThreadJob,
         activeBatchJob: state.activeBatchJob,
         pendingControlRun: state.pendingControlRun,
+        pendingRecoveryRun: state.pendingRecoveryRun,
         lastResult: state.lastResult,
         version: CONTENT_SCRIPT_VERSION
       }
@@ -456,6 +478,20 @@
     return result;
   }
 
+  async function startBackgroundNavigationLease(batch, job) {
+    const result = await sendRuntimeMessage({
+      type: "reddit-rpa-navigation-started",
+      worker_token: batch.worker_token,
+      batch_id: batch.batch_id,
+      post_fullname: job.post_fullname,
+      navigation_id: job.navigation_id,
+      target_url: job.context.canonical_url,
+      timeout_ms: navigationLeaseTimeout(job.config)
+    });
+    if (!result?.ok) throw runtimeError(result, "无法登记工作页导航租约。");
+    return result;
+  }
+
   function ensureNoActiveBatch() {
     if (state.activeBatchJob?.active) {
       throw new Error("批量采集正在运行；请只在它的工作标签页暂停、继续或等待完成，避免多个标签页混入同一批数据。");
@@ -467,6 +503,8 @@
     state.context = null;
     state.activeThreadJob = null;
     state.activeBatchJob = null;
+    state.pendingControlRun = null;
+    state.pendingRecoveryRun = null;
     state.lastResult = { ok: true, status: "cleared", reason, cleared_at: model.nowIso() };
   }
 
@@ -854,9 +892,15 @@
 
   function pageRateLimitError() {
     const pageText = model.asText(`${document.title} ${textOf(document.querySelector("main") || document.body)}`);
-    if (!RATE_LIMIT_PAGE_TEXT.test(pageText)) return null;
-    const error = new Error("Reddit 页面显示限流或临时错误；当前批次将冷却后只恢复同一帖子。");
+    const displayedHttp429 = HTTP_429_PAGE_TEXT.test(pageText);
+    if (!displayedHttp429 && !RATE_LIMIT_PAGE_TEXT.test(pageText)) return null;
+    const error = new Error(displayedHttp429
+      ? "Reddit 工作页显示 HTTP 429；来源服务端未由本扩展验证，当前批次将冷却后只恢复同一帖子。"
+      : "Reddit 页面显示限流或临时错误；当前批次将冷却后只恢复同一帖子。");
     error.code = "RATE_LIMITED";
+    error.failure_kind = displayedHttp429 ? "HTTP_429_ERROR_PAGE_OBSERVED" : "REDDIT_RATE_LIMIT_PAGE";
+    error.evidence_source = "page_dom";
+    error.displayed_http_status = displayedHttp429 ? 429 : null;
     return error;
   }
 
@@ -874,7 +918,13 @@
   function listingLimits(config = {}) {
     const targetPostCount = Math.max(1, Math.min(500, Number(config.targetPostCount) || DEFAULT_CONFIG.targetPostCount));
     const maxPosts = Math.max(1, Math.min(500, Number(config.maxPosts) || DEFAULT_CONFIG.maxPosts));
-    return { targetPostCount, maxPosts, effectiveTarget: Math.min(targetPostCount, maxPosts) };
+    const effectiveTarget = Math.min(targetPostCount, maxPosts);
+    const skipExisting = config.skipExisting === true;
+    const requestedCandidateLimit = Number(config.candidatePostLimit);
+    const candidatePostLimit = skipExisting
+      ? Math.max(effectiveTarget, Math.min(500, Number.isFinite(requestedCandidateLimit) && requestedCandidateLimit > 0 ? Math.floor(requestedCandidateLimit) : 500))
+      : maxPosts;
+    return { targetPostCount, maxPosts, effectiveTarget, skipExisting, candidatePostLimit };
   }
 
   function mergeListingRecords(existing, incoming, limit = Number.POSITIVE_INFINITY) {
@@ -889,6 +939,33 @@
 
   function limitListingRecords(records, limit) {
     return mergeListingRecords([], records, limit);
+  }
+
+  async function knownListingPostState(context) {
+    const result = await sendRuntimeMessage({ type: "reddit-rpa-list-known-post-fullnames", context });
+    if (!result?.ok) throw new Error(result?.error || "无法读取已有帖子代码，未启动补采。");
+    const fullnames = listingSelection.knownPostFullnames(result.post_fullnames);
+    return { fullnames, known_post_count: fullnames.size };
+  }
+
+  function listingSelectionFor(records, limits, known = null) {
+    if (!limits.skipExisting) {
+      const selected = limitListingRecords(records, limits.effectiveTarget);
+      return {
+        records: selected,
+        scanned_post_count: records.length,
+        skipped_existing_count: 0,
+        duplicate_listing_count: 0,
+        invalid_post_count: 0,
+        available_new_count: selected.length,
+        selected_new_count: selected.length
+      };
+    }
+    return listingSelection.selectUnseenRecords(records, known?.fullnames || new Set(), limits.effectiveTarget);
+  }
+
+  function postFullnames(items) {
+    return listingSelection.knownPostFullnames(items);
   }
 
   async function captureListing(config = {}) {
@@ -924,6 +1001,7 @@
     const safeConfig = { ...DEFAULT_CONFIG, ...config };
     const steps = Math.max(1, Math.min(100, Number(safeConfig.listingSteps) || DEFAULT_CONFIG.listingSteps));
     const limits = listingLimits(safeConfig);
+    const known = limits.skipExisting ? await knownListingPostState(context) : { fullnames: new Set(), known_post_count: 0 };
     const events = [];
     let records = [];
     let noProgress = 0;
@@ -931,22 +1009,22 @@
     for (let step = 0; step < steps; step += 1) {
       const beforeCount = records.length;
       const beforeY = window.scrollY;
-      records = mergeListingRecords(records, collectListing(context).records, limits.maxPosts);
-      if (records.length >= limits.effectiveTarget) {
-        records = limitListingRecords(records, limits.effectiveTarget);
+      records = mergeListingRecords(records, collectListing(context).records, limits.candidatePostLimit);
+      if (listingSelectionFor(records, limits, known).selected_new_count >= limits.effectiveTarget) {
+        if (!limits.skipExisting) records = limitListingRecords(records, limits.effectiveTarget);
         events.push({ step: step + 1, before_y: beforeY, after_y: beforeY, new_records: records.length - beforeCount, at: model.nowIso() });
         stopReason = "target_post_count";
         break;
       }
       window.scrollBy({ top: Math.round(window.innerHeight * Math.max(20, Math.min(95, Number(safeConfig.scrollPercent) || DEFAULT_CONFIG.scrollPercent)) / 100), behavior: "auto" });
       await delay(Math.max(150, Number(safeConfig.waitMs) || DEFAULT_CONFIG.waitMs));
-      records = mergeListingRecords(records, collectListing(context).records, limits.maxPosts);
+      records = mergeListingRecords(records, collectListing(context).records, limits.candidatePostLimit);
       const afterY = window.scrollY;
       const added = records.length - beforeCount;
       noProgress = added === 0 && afterY === beforeY ? noProgress + 1 : 0;
       events.push({ step: step + 1, before_y: beforeY, after_y: afterY, new_records: added, at: model.nowIso() });
-      if (records.length >= limits.effectiveTarget) {
-        records = limitListingRecords(records, limits.effectiveTarget);
+      if (listingSelectionFor(records, limits, known).selected_new_count >= limits.effectiveTarget) {
+        if (!limits.skipExisting) records = limitListingRecords(records, limits.effectiveTarget);
         stopReason = "target_post_count";
         break;
       }
@@ -955,24 +1033,48 @@
         break;
       }
     }
-    state.records = records;
-    const disk = await syncPostsToDisk(context, records);
+    let selection = listingSelectionFor(records, limits, known);
+    const disk = await syncPostsToDisk(context, selection.records);
+    let selectedRecords = selection.records;
+    if (limits.skipExisting) {
+      const created = postFullnames(disk.created);
+      const existingAfterRead = Math.max(0, Number(disk.existing_count) || 0);
+      selectedRecords = selectedRecords.filter((record) => created.has(listingSelection.postFullname(record?.fullname)));
+      selection = {
+        ...selection,
+        records: selectedRecords,
+        selected_new_count: selectedRecords.length,
+        skipped_existing_count: selection.skipped_existing_count + existingAfterRead,
+        post_sync_existing_count: existingAfterRead
+      };
+    }
+    state.records = selectedRecords;
     state.lastResult = {
       ok: true,
       status: "completed",
       mode: "listing_sync",
-      records: records.length,
+      records: selectedRecords.length,
       requested_steps: steps,
       completed_steps: events.length,
       target_post_count: limits.targetPostCount,
       max_posts: limits.maxPosts,
+      candidate_post_limit: limits.candidatePostLimit,
+      skip_existing: limits.skipExisting,
+      known_post_count: known.known_post_count,
+      scanned_post_count: selection.scanned_post_count,
+      skipped_existing_count: selection.skipped_existing_count,
+      available_new_count: selection.available_new_count,
+      selected_new_count: selection.selected_new_count,
+      duplicate_listing_count: selection.duplicate_listing_count,
+      invalid_post_count: selection.invalid_post_count,
+      post_sync_existing_count: selection.post_sync_existing_count || 0,
       stop_reason: stopReason || "requested_steps",
       events,
       directory_sync: disk,
-      quality: model.qualitySummary(records)
+      quality: model.qualitySummary(selectedRecords)
     };
     await persist();
-    return returnRecords ? { result: state.lastResult, records, context, limits } : state.lastResult;
+    return returnRecords ? { result: state.lastResult, records: selectedRecords, context, limits, selection } : state.lastResult;
   }
 
   function canResumeThreadJob(context) {
@@ -980,10 +1082,11 @@
     return Boolean(job?.active && context.page_type === "thread" && postContextsMatch(job.context, context));
   }
 
-  function newThreadJob(context, config = {}) {
+  function newThreadJob(context, config = {}, currentNavigationId = null) {
     return {
       active: true,
       capture_id: timestampLabel(),
+      navigation_id: currentNavigationId || navigationId(),
       context: { ...context, canonical_url: model.canonicalPostUrl(context.canonical_url, context.post_fullname) || context.canonical_url },
       post_fullname: context.post_fullname,
       initial_url: normalisedPageUrl(),
@@ -1121,6 +1224,8 @@
       manual_count: job.manual?.length || 0,
       failed_count: job.failed?.length || 0,
       rate_limit: job.rate_limit || null,
+      navigation_failure: job.navigation_failure || null,
+      recovery: job.recovery || null,
       selection_mode: job.selection_mode || "selected",
       worker_tab_id: Number.isInteger(job.worker_tab_id) ? job.worker_tab_id : null,
       manifest_path: job.manifest_path || null,
@@ -1152,7 +1257,11 @@
       reported_comment_count: fields.reported_comment_count ?? null,
       collected_comment_count: fields.collected_comment_count ?? null,
       cooldown_ms: fields.cooldown_ms ?? null,
-      tree_diagnostics: fields.tree_diagnostics || null
+      tree_diagnostics: fields.tree_diagnostics || null,
+      navigation_id: fields.navigation_id ?? state.activeThreadJob?.navigation_id ?? batch.current?.navigation_id ?? null,
+      failure_kind: fields.failure_kind ?? null,
+      evidence_source: fields.evidence_source ?? null,
+      displayed_http_status: fields.displayed_http_status ?? null
     };
     try {
       const result = await sendRuntimeMessage({
@@ -1432,7 +1541,7 @@
     });
   }
 
-  async function createBatch(context, targets, config = {}, selectionMode = "selected") {
+  async function createBatch(context, targets, config = {}, selectionMode = "selected", recovery = null) {
     if (!targets.length) throw new Error("没有可验证的帖子目标，未启动批量采集。");
     const batchId = timestampLabel();
     const worker = await claimBatchWorker(batchId);
@@ -1448,6 +1557,7 @@
     state.activeBatchJob.worker_token = worker.worker_token;
     state.activeBatchJob.worker_tab_id = worker.tab_id;
     state.activeBatchJob.selection_mode = selectionMode;
+    state.activeBatchJob.recovery = recovery;
     try {
       await persistBatchManifest(state.activeBatchJob);
       await recordBatchEvent("batch_started", { post_fullname: null }, state.activeBatchJob);
@@ -1495,15 +1605,42 @@
   async function syncAndStartBatch(config = {}) {
     const listing = await runListing(config, { returnRecords: true });
     const targets = listingBatchTargets(listing.records);
-    if (!targets.length) throw new Error("列表同步后没有得到可验证的帖子，未启动批量采集。");
-    const result = await createBatch(listing.context, targets, config, "just_synced");
-    return { ...result, listing: listing.result };
+    if (!targets.length) {
+      if (!listing.limits.skipExisting) throw new Error("列表同步后没有得到可验证的帖子，未启动批量采集。");
+      state.lastResult = {
+        ...listing.result,
+        ok: true,
+        status: "no_unseen_posts",
+        requested_count: listing.limits.effectiveTarget,
+        no_batch_started: true
+      };
+      await persist();
+      return state.lastResult;
+    }
+    const selectionMode = listing.limits.skipExisting ? "unseen_current_listing" : "just_synced";
+    const result = await createBatch(listing.context, targets, config, selectionMode);
+    return {
+      ...result,
+      listing: listing.result,
+      selection: {
+        skip_existing: listing.limits.skipExisting,
+        known_post_count: listing.result.known_post_count,
+        scanned_post_count: listing.result.scanned_post_count,
+        skipped_existing_count: listing.result.skipped_existing_count,
+        selected_new_count: listing.result.selected_new_count
+      }
+    };
   }
 
   function controlSubredditName(value) {
     const subreddit = String(value || "").trim();
     if (!/^[A-Za-z0-9_]+$/.test(subreddit)) throw new Error("控制命令的 subreddit 无效。");
     return subreddit;
+  }
+
+  function controlSkipExisting(value) {
+    if (value != null && typeof value !== "boolean") throw new Error("控制命令的 skip_existing 必须是布尔值。");
+    return value === true;
   }
 
   function controlBatch(batchId) {
@@ -1525,14 +1662,15 @@
     return state.lastResult;
   }
 
-  async function runControlledBatch({ subreddit, count } = {}) {
+  async function runControlledBatch({ subreddit, count, skip_existing: skipExisting } = {}) {
     const safeSubreddit = controlSubredditName(subreddit);
     const safeCount = Math.max(1, Math.min(50, Math.floor(Number(count) || 0)));
+    const safeSkipExisting = controlSkipExisting(skipExisting);
     const context = currentContext();
     ensureNoActiveBatch();
     if (context.page_type !== "listing" || !context.subreddit || context.subreddit.toLowerCase() !== safeSubreddit.toLowerCase()) {
-      state.pendingControlRun = { subreddit: safeSubreddit, count: safeCount };
-      state.lastResult = { ok: true, status: "control_preparing", subreddit: safeSubreddit, count: safeCount };
+      state.pendingControlRun = { subreddit: safeSubreddit, count: safeCount, skip_existing: safeSkipExisting };
+      state.lastResult = { ok: true, status: "control_preparing", subreddit: safeSubreddit, count: safeCount, skip_existing: safeSkipExisting };
       await persist();
       navigateOrResumeThread(`https://www.reddit.com/r/${encodeURIComponent(safeSubreddit)}/new/`);
       return state.lastResult;
@@ -1542,8 +1680,65 @@
     await persist();
     return syncAndStartBatch({
       targetPostCount: safeCount,
-      maxPosts: safeCount
+      maxPosts: safeCount,
+      skipExisting: safeSkipExisting,
+      candidatePostLimit: safeSkipExisting ? 500 : safeCount
     });
+  }
+
+  function recoverySourceBatchId(value) {
+    const batchId = String(value || "").trim();
+    if (!/^[A-Za-z0-9_.-]+$/.test(batchId)) throw new Error("精确补采缺少有效的源批次 ID。");
+    return batchId;
+  }
+
+  async function retryUnfinishedBatch({ source_batch_id: sourceBatchId } = {}) {
+    ensureNoActiveBatch();
+    const safeSourceBatchId = recoverySourceBatchId(sourceBatchId);
+    const recovery = await sendRuntimeMessage({
+      type: "reddit-rpa-load-recovery-targets",
+      source_batch_id: safeSourceBatchId
+    });
+    if (!recovery?.ok) throw runtimeError(recovery, "无法读取源批次的未完成目标。");
+    const context = currentContext();
+    const subreddit = controlSubredditName(recovery.subreddit);
+    if (context.page_type !== "listing" || context.subreddit?.toLowerCase() !== subreddit.toLowerCase()) {
+      state.pendingControlRun = null;
+      state.pendingRecoveryRun = { source_batch_id: safeSourceBatchId, subreddit };
+      state.lastResult = {
+        ok: true,
+        status: "recovery_preparing",
+        source_batch_id: safeSourceBatchId,
+        subreddit,
+        recovery_count: Number(recovery.recovery_count) || 0
+      };
+      await persist();
+      navigateOrResumeThread(`https://www.reddit.com/r/${encodeURIComponent(subreddit)}/new/`);
+      return state.lastResult;
+    }
+    ensureContext(context);
+    state.pendingRecoveryRun = null;
+    if (!Array.isArray(recovery.targets) || !recovery.targets.length) {
+      state.lastResult = {
+        ok: true,
+        status: "no_recovery_targets",
+        source_batch_id: safeSourceBatchId,
+        subreddit
+      };
+      await persist();
+      return state.lastResult;
+    }
+    return createBatch(
+      context,
+      recovery.targets,
+      recovery.config || {},
+      "unfinished_from_batch",
+      {
+        source_batch_id: safeSourceBatchId,
+        source_statuses: ["unprocessed", "interrupted"],
+        target_count: recovery.targets.length
+      }
+    );
   }
 
   async function pauseControlledBatch({ batch_id: batchId } = {}) {
@@ -1697,7 +1892,11 @@
   }
 
   function rateLimitedError(error) {
-    return ["RATE_LIMITED", "PAGE_NAVIGATION_TIMEOUT"].includes(error?.code);
+    return error?.code === "RATE_LIMITED";
+  }
+
+  function navigationTimeoutError(error) {
+    return error?.code === "PAGE_NAVIGATION_TIMEOUT";
   }
 
   function scheduleRateLimitResume(batch = state.activeBatchJob) {
@@ -1721,6 +1920,9 @@
       failure_count: Number(target.rate_limit_failures) || 2,
       reason_code: error?.code || "RATE_LIMITED",
       reason: message,
+      failure_kind: error?.failure_kind || "REDDIT_RATE_LIMIT_PAGE",
+      evidence_source: error?.evidence_source || "page_dom",
+      displayed_http_status: error?.displayed_http_status ?? null,
       cooldown_until: null,
       outcome: "manual"
     };
@@ -1751,7 +1953,10 @@
     await recordBatchEvent("rate_limited", {
       post_fullname: target.post?.fullname,
       reason_code: error?.code || "RATE_LIMITED",
-      reason: message
+      reason: message,
+      failure_kind: error?.failure_kind || "REDDIT_RATE_LIMIT_PAGE",
+      evidence_source: error?.evidence_source || "page_dom",
+      displayed_http_status: error?.displayed_http_status ?? null
     }, batch);
     const result = await completeBatchItem({ status: "manual", error: message, audit });
     state.lastResult = {
@@ -1778,6 +1983,9 @@
       failure_count: target.rate_limit_failures,
       reason_code: error?.code || "RATE_LIMITED",
       reason: message,
+      failure_kind: error?.failure_kind || "REDDIT_RATE_LIMIT_PAGE",
+      evidence_source: error?.evidence_source || "page_dom",
+      displayed_http_status: error?.displayed_http_status ?? null,
       cooldown_until: cooldownUntil,
       outcome: "cooling_down"
     };
@@ -1788,7 +1996,10 @@
       post_fullname: target.post?.fullname,
       reason_code: batch.rate_limit.reason_code,
       reason: message,
-      cooldown_ms: cooldownMs
+      cooldown_ms: cooldownMs,
+      failure_kind: batch.rate_limit.failure_kind,
+      evidence_source: batch.rate_limit.evidence_source,
+      displayed_http_status: batch.rate_limit.displayed_http_status
     }, batch);
     state.lastResult = {
       ok: false,
@@ -1801,6 +2012,47 @@
     if (!await persistBatchProgress(batch)) return state.lastResult;
     await persist();
     scheduleRateLimitResume(batch);
+    return state.lastResult;
+  }
+
+  async function pauseBatchForNavigationFailure(batch, error) {
+    const target = batch.current;
+    const message = String(error?.message || error);
+    target.navigation_failures = (Number(target.navigation_failures) || 0) + 1;
+    target.last_failure = {
+      navigation_id: state.activeThreadJob?.navigation_id || target.navigation_id || null,
+      failure_kind: error?.failure_kind || "PAGE_NAVIGATION_TIMEOUT",
+      reason_code: error?.code || "PAGE_NAVIGATION_TIMEOUT",
+      evidence_source: error?.evidence_source || "page_dom",
+      displayed_http_status: error?.displayed_http_status ?? null,
+      observed_at: model.nowIso()
+    };
+    batch.navigation_failure = {
+      ...target.last_failure,
+      post_fullname: target.post?.fullname || null,
+      reason: message
+    };
+    batchQueue.pause(batch);
+    state.activeThreadJob = null;
+    state.records = [];
+    await recordBatchEvent("navigation_timeout", {
+      post_fullname: target.post?.fullname,
+      reason_code: error?.code || "PAGE_NAVIGATION_TIMEOUT",
+      reason: message,
+      failure_kind: target.last_failure.failure_kind,
+      evidence_source: target.last_failure.evidence_source,
+      displayed_http_status: target.last_failure.displayed_http_status,
+      navigation_id: target.last_failure.navigation_id
+    }, batch);
+    state.lastResult = {
+      ok: false,
+      code: error?.code || "PAGE_NAVIGATION_TIMEOUT",
+      status: "batch_navigation_paused",
+      error: message,
+      batch: batchSummary(batch)
+    };
+    if (!await persistBatchProgress(batch)) return state.lastResult;
+    await persist();
     return state.lastResult;
   }
 
@@ -1819,6 +2071,7 @@
       return pauseBatchForOutputPermission(batch, error);
     }
     if (rateLimitedError(error)) return pauseBatchForRateLimit(batch, error);
+    if (navigationTimeoutError(error)) return pauseBatchForNavigationFailure(batch, error);
     const retry = batch.paused ? { retry: false, target } : batchQueue.retry(batch, message);
     if (retry.retry && !batch.paused) {
       state.activeThreadJob = null;
@@ -1868,15 +2121,19 @@
     }
     if (claimed.status === "paused") return { ok: true, status: "batch_paused", batch: batchSummary() };
     try {
-      if (!await persistBatchProgress(batch)) return state.lastResult;
       const targetContext = threadTargetContext(batch.current, batch.context);
+      const currentNavigationId = navigationId();
+      batch.current.navigation_id = currentNavigationId;
       state.records = [];
-      state.activeThreadJob = newThreadJob(targetContext, batch.config);
+      state.activeThreadJob = newThreadJob(targetContext, batch.config, currentNavigationId);
+      if (!await persistBatchProgress(batch)) return state.lastResult;
       state.lastResult = { ok: true, status: "navigating_batch_post", target: { fullname: batch.current.post.fullname, title: batch.current.post.title || "" }, batch: batchSummary() };
       await recordBatchEvent("post_navigation_started", {
         post_fullname: batch.current.post.fullname,
-        attempt: batch.current.attempts
+        attempt: batch.current.attempts,
+        navigation_id: currentNavigationId
       }, batch);
+      await startBackgroundNavigationLease(batch, state.activeThreadJob);
       await persist();
       navigateOrResumeThread(batch.current.permalink);
       return state.lastResult;
@@ -2097,6 +2354,7 @@
         case "syncAndStartBatch": return syncAndStartBatch(message.config || {});
         case "prepareControlPage": return prepareControlPage(message);
         case "runControlledBatch": return runControlledBatch(message);
+        case "retryUnfinishedBatch": return retryUnfinishedBatch(message);
         case "pauseControlledBatch": return pauseControlledBatch(message);
         case "resumeControlledBatch": return resumeControlledBatch(message);
         case "cancelControlledBatch": return cancelControlledBatch(message);
@@ -2115,7 +2373,7 @@
       commandResponsePending = false;
       flushDeferredThreadNavigation();
     }).catch(async (error) => {
-      const captureCommand = ["captureThread", "resumeThread", "syncAndStartBatch", "runControlledBatch", "startLatestListingBatch", "startBatch", "resumeBatch", "resumeControlledBatch"].includes(message?.command);
+      const captureCommand = ["captureThread", "resumeThread", "syncAndStartBatch", "runControlledBatch", "retryUnfinishedBatch", "startLatestListingBatch", "startBatch", "resumeBatch", "resumeControlledBatch"].includes(message?.command);
       const result = captureCommand
         ? await recordThreadError(error).catch(() => ({ ok: false, code: "CAPTURE_FAILED", error: String(error?.message || error) }))
         : { ok: false, code: "CAPTURE_FAILED", error: String(error?.message || error) };

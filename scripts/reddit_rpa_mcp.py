@@ -17,7 +17,7 @@ from typing import Any
 from reddit_rpa_control import ControlError, command_result, default_root
 
 
-SERVER_INFO = {"name": "reddit-rpa-control", "version": "0.8.0"}
+SERVER_INFO = {"name": "reddit-rpa-control", "version": "0.8.2"}
 TOOLS = [
     {
         "name": "reddit_rpa_health",
@@ -31,8 +31,13 @@ TOOLS = [
     },
     {
         "name": "reddit_rpa_run",
-        "description": "一次启动列表同步和固定数量的帖子评论采集；Chrome 扩展仍是唯一 DOM 采集器。",
-        "inputSchema": {"type": "object", "properties": {"subreddit": {"type": "string"}, "count": {"type": "integer", "minimum": 1, "maximum": 50}, "collector_id": {"type": "string"}, "timeout": {"type": "number"}, "root": {"type": "string"}}, "required": ["subreddit"]},
+        "description": "一次启动列表同步和固定数量的帖子评论采集；skip_existing=true 时只入队当前 /new/ 中尚未写入 raw/ 的 t3_*。",
+        "inputSchema": {"type": "object", "properties": {"subreddit": {"type": "string"}, "count": {"type": "integer", "minimum": 1, "maximum": 50}, "skip_existing": {"type": "boolean"}, "collector_id": {"type": "string"}, "timeout": {"type": "number"}, "root": {"type": "string"}}, "required": ["subreddit"]},
+    },
+    {
+        "name": "reddit_rpa_retry_unfinished",
+        "description": "从一个历史 batch.json 精确重建 unprocessed 与 interrupted 目标；不扫描当前 /new/，也不改写源批次。",
+        "inputSchema": {"type": "object", "properties": {"source_batch_id": {"type": "string"}, "collector_id": {"type": "string"}, "timeout": {"type": "number"}, "root": {"type": "string"}}, "required": ["source_batch_id"]},
     },
     {
         "name": "reddit_rpa_pause",
@@ -89,6 +94,7 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         "reddit_rpa_health": "health",
         "reddit_rpa_prepare": "prepare",
         "reddit_rpa_run": "run",
+        "reddit_rpa_retry_unfinished": "retry_unfinished",
         "reddit_rpa_pause": "pause",
         "reddit_rpa_resume": "resume",
         "reddit_rpa_cancel": "cancel",
@@ -107,7 +113,9 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         collector_id=arguments.get("collector_id"),
         subreddit=arguments.get("subreddit"),
         count=arguments.get("count", 25),
+        skip_existing=arguments.get("skip_existing", False),
         batch_id=arguments.get("batch_id"),
+        source_batch_id=arguments.get("source_batch_id"),
         limit=int(arguments.get("limit", 20)),
     )
     try:

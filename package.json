@@ -1,6 +1,6 @@
 {
   "name": "reddit-rpa-assistant",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "description": "A local Manifest V3 Reddit page collector with auditable offline processing tools.",
   "private": true,
   "type": "module",
@@ -12,7 +12,7 @@
     "test": "npm run test:node && npm run test:python",
     "test:node": "node --test tests/*.test.mjs tests/*.test.cjs",
     "test:python": "python3 -m unittest discover -s tests -p 'test_*.py' -v",
-    "check:js": "node --check content.js && node --check popup.js && node --check service-worker.js && node --check reddit-dom-selectors.js && node --check reddit-model.js && node --check batch-queue.js && node --check output-store.js && node --check output-paths.mjs && node --check post-storage.mjs && node --check subreddit-registry.mjs",
+    "check:js": "node --check content.js && node --check popup.js && node --check service-worker.js && node --check reddit-dom-selectors.js && node --check reddit-model.js && node --check batch-queue.js && node --check listing-selection.js && node --check output-store.js && node --check output-paths.mjs && node --check post-storage.mjs && node --check subreddit-registry.mjs",
     "check:python": "python3 -m py_compile scripts/reddit_rpa_control.py scripts/reddit_rpa_mcp.py scripts/build_comment_tree_review_queue.py scripts/build_final_documents.py scripts/build_translation_documents.py scripts/install_native_host.py scripts/merge_and_summarize.py scripts/migrate_runs_to_post_folders.py scripts/verify_collection_scope.py native-host/reddit_rpa_native_host.py",
     "check": "npm run check:js && npm run check:python"
   }

@@ -27,12 +27,17 @@ REQUEST_SCHEMA = "reddit-rpa-control-request-v1"
 RESPONSE_SCHEMA = "reddit-rpa-control-response-v1"
 COLLECTOR_SCHEMA = "reddit-rpa-collector-v1"
 OUTPUT_LAYER = "raw"
-COMMANDS = {"prepare", "run", "pause", "resume", "cancel"}
+COMMANDS = {"prepare", "run", "retry_unfinished", "pause", "resume", "cancel"}
 CONTROL_CLAIM_LEASE_SECONDS = 90
 EVENTS = {
     "batch_started", "post_navigation_started", "page_ready", "capture_saved", "retry", "paused", "resumed",
-    "rate_limited", "rate_limit_cooldown_complete", "permission_required", "batch_finished", "cancelled",
+    "rate_limited", "rate_limit_cooldown_complete", "permission_required", "navigation_error_observed", "navigation_timeout", "batch_finished", "cancelled",
 }
+NAVIGATION_FAILURE_KINDS = {
+    "HTTP_429_ERROR_PAGE_OBSERVED", "REDDIT_RATE_LIMIT_PAGE", "CLIENT_BLOCKED",
+    "NAVIGATION_ERROR_PAGE", "PAGE_NAVIGATION_TIMEOUT",
+}
+NAVIGATION_EVIDENCE_SOURCES = {"page_dom", "tab_metadata", "background_watchdog"}
 
 
 class HostError(RuntimeError):
@@ -344,6 +349,8 @@ class CollectionStore:
             "permalink": target.get("permalink"),
             "attempts": count(target.get("attempts")),
             "rate_limit_failures": count(target.get("rate_limit_failures")),
+            "navigation_failures": count(target.get("navigation_failures")),
+            "last_failure": target.get("last_failure") if isinstance(target.get("last_failure"), dict) else None,
             "status": status,
             "error": target.get("error") or target.get("last_error"),
             "finished_at": target.get("finished_at"),
@@ -365,7 +372,10 @@ class CollectionStore:
             "active": bool(batch.get("active")), "paused": bool(batch.get("paused")), "cancelled": cancelled,
             "cancelled_at": batch.get("cancelled_at"), "cancel_reason": batch.get("cancel_reason"),
             "selected_count": count(batch.get("selected_count")), "selection_mode": batch.get("selection_mode") or "selected",
-            "config": batch.get("config") or {}, "rate_limit": batch.get("rate_limit"), "targets": targets,
+            "config": batch.get("config") or {}, "rate_limit": batch.get("rate_limit"),
+            "navigation_failure": batch.get("navigation_failure") if isinstance(batch.get("navigation_failure"), dict) else None,
+            "recovery": batch.get("recovery") if isinstance(batch.get("recovery"), dict) else None,
+            "targets": targets,
             "integrity": batch.get("integrity"),
         }
 
@@ -380,6 +390,51 @@ class CollectionStore:
         self.atomic_write(path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
         return {"ok": True, "status": "batch_manifest_stored", "relativePath": f"{OUTPUT_LAYER}/batches/{batch_id}.json", "manifest": manifest}
 
+    def recovery_target(self, target: dict[str, Any], subreddit: str) -> dict[str, Any] | None:
+        fullname = valid_fullname(target.get("fullname"), "t3")
+        permalink = as_text(target.get("permalink"))
+        if not fullname or not permalink:
+            return None
+        parsed = urlparse(permalink)
+        path_parts = [part for part in parsed.path.split("/") if part]
+        post_id = fullname.removeprefix("t3_")
+        if parsed.scheme != "https" or parsed.hostname not in {"reddit.com", "www.reddit.com"}:
+            return None
+        if len(path_parts) < 4 or path_parts[0].lower() != "r" or path_parts[1].lower() != subreddit.lower() or path_parts[2].lower() != "comments" or path_parts[3].lower() != post_id.lower():
+            return None
+        return {
+            "post": {
+                "record_type": "post", "fullname": fullname, "post_fullname": fullname, "post_id": post_id,
+                "subreddit": subreddit, "title": as_text(target.get("title")), "canonical_url": permalink,
+            },
+            "permalink": permalink,
+            "attempts": 0,
+            "recovery_source_status": as_text(target.get("status")),
+        }
+
+    def load_recovery_targets(self, payload: dict[str, Any]) -> dict[str, Any]:
+        source_batch_id = as_text(payload.get("source_batch_id"))
+        if not valid_identifier(source_batch_id):
+            raise HostError("RECOVERY_SOURCE_INVALID", "源批次 ID 无效，未创建补采批次。")
+        manifest = self.read_json(self.root / OUTPUT_LAYER / "batches" / f"{source_batch_id}.json")
+        if manifest.get("schema") != "reddit-rpa-batch-v1" or as_text(manifest.get("batch_id")) != source_batch_id:
+            raise HostError("RECOVERY_SOURCE_INVALID", "源批次清单无效，未创建补采批次。")
+        subreddit = canonical_subreddit(manifest.get("subreddit"))
+        if not subreddit:
+            raise HostError("RECOVERY_SOURCE_INVALID", "源批次缺少有效 subreddit，未创建补采批次。")
+        recovered: dict[str, dict[str, Any]] = {}
+        for target in manifest.get("targets") or []:
+            if not isinstance(target, dict) or as_text(target.get("status")) not in {"unprocessed", "interrupted"}:
+                continue
+            prepared = self.recovery_target(target, subreddit)
+            if prepared:
+                recovered[prepared["post"]["fullname"].lower()] = prepared
+        return {
+            "ok": True, "status": "recovery_targets_loaded", "source_batch_id": source_batch_id,
+            "subreddit": subreddit, "config": manifest.get("config") if isinstance(manifest.get("config"), dict) else {},
+            "targets": list(recovered.values()), "recovery_count": len(recovered),
+        }
+
     def normalise_event(self, event: dict[str, Any]) -> dict[str, Any]:
         batch_id, event_name = as_text(event.get("batch_id")), as_text(event.get("event"))
         if not valid_identifier(batch_id):
@@ -389,6 +444,18 @@ class CollectionStore:
         post_fullname = event.get("post_fullname")
         if post_fullname is not None and not valid_fullname(post_fullname, "t3"):
             raise HostError("BATCH_EVENT_INVALID", "批次事件的帖子代码无效，未写入事件日志。")
+        navigation_id = as_text(event.get("navigation_id")) or None
+        if navigation_id and not valid_identifier(navigation_id):
+            raise HostError("BATCH_EVENT_INVALID", "批次事件的导航标识无效，未写入事件日志。")
+        failure_kind = as_text(event.get("failure_kind")) or None
+        if failure_kind and failure_kind not in NAVIGATION_FAILURE_KINDS:
+            raise HostError("BATCH_EVENT_INVALID", "批次事件的失败分类无效，未写入事件日志。")
+        evidence_source = as_text(event.get("evidence_source")) or None
+        if evidence_source and evidence_source not in NAVIGATION_EVIDENCE_SOURCES:
+            raise HostError("BATCH_EVENT_INVALID", "批次事件的证据来源无效，未写入事件日志。")
+        displayed_http_status = optional_number(event.get("displayed_http_status"))
+        if displayed_http_status is not None and not 100 <= displayed_http_status <= 599:
+            raise HostError("BATCH_EVENT_INVALID", "批次事件的 HTTP 状态无效，未写入事件日志。")
         return {
             "schema": "reddit-rpa-batch-event-v1", "event_id": f"{batch_id}:{count(event.get('seq'))}", "seq": count(event.get("seq")),
             "at": as_text(event.get("at")) or now(), "batch_id": batch_id, "event": event_name, "post_fullname": post_fullname,
@@ -396,6 +463,8 @@ class CollectionStore:
             "reason_code": event.get("reason_code"), "reason": event.get("reason"),
             "reported_comment_count": optional_number(event.get("reported_comment_count")), "collected_comment_count": optional_number(event.get("collected_comment_count")),
             "cooldown_ms": optional_number(event.get("cooldown_ms")), "tree_diagnostics": self.tree_diagnostics(event.get("tree_diagnostics")),
+            "navigation_id": navigation_id, "failure_kind": failure_kind, "evidence_source": evidence_source,
+            "displayed_http_status": displayed_http_status,
         }
 
     def store_batch_event(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -427,6 +496,30 @@ class CollectionStore:
         posts = self.posts_in_layer(self.root / OUTPUT_LAYER / entry["slug"], entry, context)
         posts.sort(key=lambda item: (as_text(item.get("captured_at")), as_text((item.get("post") or {}).get("title"))), reverse=True)
         return {"ok": True, "status": "known_posts", "subreddit": context.get("subreddit"), "posts": posts}
+
+    def list_known_post_fullnames(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Read only the current subreddit's persisted t3 identities for supplement runs."""
+        context = payload.get("context") or {}
+        entry = self.registry_entry(context, allow_register=False)
+        directory = self.root / OUTPUT_LAYER / as_text(entry.get("slug"))
+        fullnames: set[str] = set()
+        if directory.exists():
+            for post_directory in directory.iterdir():
+                if not post_directory.is_dir():
+                    continue
+                document = self.read_json(post_directory / "post.json", optional=True) or {}
+                post = document.get("post") if isinstance(document.get("post"), dict) else {}
+                if as_text(post.get("subreddit")).lower() != as_text(context.get("subreddit")).lower():
+                    continue
+                fullname = valid_fullname(post.get("fullname"), "t3")
+                if fullname:
+                    fullnames.add(fullname)
+        return {
+            "ok": True,
+            "status": "known_post_fullnames",
+            "subreddit": context.get("subreddit"),
+            "post_fullnames": sorted(fullnames),
+        }
 
     def validate_comment_owners(self, _payload: dict[str, Any]) -> dict[str, Any]:
         layer = self.root / OUTPUT_LAYER
@@ -511,8 +604,8 @@ class CollectionStore:
         collector_id = as_text(request.get("collector_id"))
         if not valid_identifier(collector_id):
             raise HostError("CONTROL_COLLECTOR_REQUIRED", "控制请求缺少有效 collector_id，未执行。")
-        normalised = {"request_id": request["request_id"], "command": command, "created_at": as_text(request.get("created_at")), "collector_id": collector_id, "batch_id": as_text(request.get("batch_id")) or None, "subreddit": None, "count": None}
-        if command in {"prepare", "run"}:
+        normalised = {"request_id": request["request_id"], "command": command, "created_at": as_text(request.get("created_at")), "collector_id": collector_id, "batch_id": as_text(request.get("batch_id")) or None, "source_batch_id": as_text(request.get("source_batch_id")) or None, "subreddit": None, "count": None, "skip_existing": False}
+        if command in {"prepare", "run", "retry_unfinished"}:
             entry = self.registry_entry({"subreddit": request.get("subreddit")}, allow_register=False)
             normalised["subreddit"] = entry["subreddit"]
         if command == "run":
@@ -520,8 +613,14 @@ class CollectionStore:
             if requested is None or not 1 <= requested <= 50:
                 raise HostError("CONTROL_COUNT_INVALID", "控制采集数量必须是 1 到 50 之间的整数，未执行。")
             normalised["count"] = requested
+            skip_existing = request.get("skip_existing", False)
+            if not isinstance(skip_existing, bool):
+                raise HostError("CONTROL_SKIP_EXISTING_INVALID", "skip_existing 必须是布尔值，未执行。")
+            normalised["skip_existing"] = skip_existing
         if command in {"pause", "resume", "cancel"} and not valid_identifier(normalised["batch_id"]):
             raise HostError("CONTROL_BATCH_INVALID", "控制命令缺少有效 batch_id，未执行。")
+        if command == "retry_unfinished" and not valid_identifier(normalised["source_batch_id"]):
+            raise HostError("RECOVERY_SOURCE_INVALID", "精确补采命令缺少有效源批次 ID，未执行。")
         return normalised
 
     def requeue_expired_control_claims(self, requests: Path) -> None:
@@ -601,6 +700,8 @@ class CollectionStore:
             "sync_posts": lambda: self.sync_posts(payload), "store_thread": lambda: self.store_thread(payload),
             "record_thread_failure": lambda: self.record_thread_failure(payload), "store_batch": lambda: self.store_batch(payload),
             "store_batch_event": lambda: self.store_batch_event(payload), "list_known_posts": lambda: self.list_known_posts(payload),
+            "list_known_post_fullnames": lambda: self.list_known_post_fullnames(payload),
+            "load_recovery_targets": lambda: self.load_recovery_targets(payload),
             "validate_comment_owners": lambda: self.validate_comment_owners(payload), "write_collector_heartbeat": lambda: self.write_collector_heartbeat(payload), "next_control_request": lambda: self.next_control_request(payload),
             "write_control_response": lambda: self.write_control_response(payload), "cancel_orphaned_batch": lambda: self.cancel_orphaned_batch(payload),
         }

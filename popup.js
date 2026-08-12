@@ -96,6 +96,14 @@ function resultPresentation(value) {
   if (status === "batch_rate_limited_manual_review") {
     return { kind: "warn", label: "限流待复核", message: "同一帖子在冷却后再次失败，已标为 manual 并暂停批次。" };
   }
+  if (status === "batch_rate_limit_observed") {
+    return { kind: "warn", label: "观察到 429 页面", message: "浏览器工作页显示 HTTP 429，扩展未断言其服务端来源；批次已暂停，冷却后仅恢复当前帖子。" };
+  }
+  if (status === "batch_navigation_paused") {
+    const failure = batch?.navigation_failure || value.navigation_failure || {};
+    const label = failure.failure_kind === "CLIENT_BLOCKED" ? "客户端拦截" : "工作页导航异常";
+    return { kind: "warn", label, message: "当前帖子已暂停并保留队列；请恢复正常工作页后再继续。" };
+  }
   if (["batch_manual_review_required", "manual_review_required"].includes(status)) {
     return { kind: "warn", label: "待人工复核", message: batchProgressText(batch) };
   }

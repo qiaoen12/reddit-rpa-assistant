@@ -27,7 +27,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | 扩展 UI | popup.html、popup.js、popup.css | 启动同步/采集、显示批次状态、请求目录授权 | 直接解析全页 DOM、调用 Reddit 网络接口 |
 | 内容脚本 | content.js、reddit-model.js、reddit-dom-selectors.js | 读取当前页面已渲染节点、展开控件、证明 Post/Comment 归属、提交结构化消息 | 直接写任意本地路径、读取凭据、并行控制多个工作页 |
-| 后台 Service Worker | service-worker.js、batch-queue.js | 单工作页锁、队列、导航、重试、权限预检、写入路由、Native Host 桥接 | 通过 fetch 访问 Reddit API、猜测缺失评论 |
+| 后台 Service Worker | service-worker.js、batch-queue.js | 单工作页锁、队列、导航租约、重试、权限预检、写入路由、Native Host 桥接 | 通过 fetch 访问 Reddit API、读取错误页正文、猜测缺失评论 |
 | 浏览器回退写入 | output-store.js、output-paths.mjs、post-storage.mjs | 使用用户授予的目录句柄、校验安全目录名、原子落盘 | 选择用户未授权的目录、访问冻结层 |
 | Native Host | native-host/reddit_rpa_native_host.py | 校验请求、固定集合根目录、原子写入、维护控制信箱 | 接收任意扩展传入的路径、打开网页、启动 HTTP 服务 |
 | 控制面 | scripts/reddit_rpa_control.py、scripts/reddit_rpa_mcp.py | 读取心跳/状态、写入结构化控制请求、返回结构化错误 | 直接驱动 DOM、改写帖子/评论或伪造完成状态 |
@@ -64,6 +64,9 @@ CLI/MCP 的请求不会直接传给 Reddit 页面。Native Host 以租约/claim 
 - 写入先生成临时文件，再用原子替换；控制请求/响应也使用固定目录和安全 ID。
 - 单工作页锁、防旧脚本接管和批次 token 用于避免扩展重载后两个控制器同时写入。
 - 取消只标记未处理目标，不删除已经写入的帖子或评论。
+- `run` 的 `skip_existing` 补采模式只读取活跃 `raw/` 的 Post ID，在当前 `/new/` 中筛选未见 `t3_*` 后才建批次；冻结层不参与差集。
+- 每次批量目标导航在跳转前由内容脚本向后台登记 `navigation_id` 租约。内容脚本在成功进入页面后以 `page_ready` 结束租约；若错误页不匹配 Reddit content script，后台只依据 tab 标题/URL 或超时 watchdog 写入 `navigation_error_observed` / `navigation_timeout`，并暂停该批次。
+- `retry_unfinished` 从历史 manifest 精确读取 `unprocessed` / `interrupted` 目标，建立含 `recovery` 血缘的新批次；它不是 `/new/` 差集扫描，也不会修改源批次。
 
 ## 5. 状态语义
 
@@ -77,6 +80,8 @@ CLI/MCP 的请求不会直接传给 Reddit 页面。Native Host 以租约/claim 
 | interrupted | 浏览器/扩展/工作页在批次中断 | 保留已完成目标，确认后恢复或重新执行 |
 
 “完成”是页面可验证性的结论，不是 Reddit 服务器数据完整性的承诺。
+
+导航失败还会带有独立分类：`HTTP_429_ERROR_PAGE_OBSERVED` 表示浏览器曾显示 429，`REDDIT_RATE_LIMIT_PAGE` 表示内容脚本在 Reddit DOM 中识别到限流文案，`CLIENT_BLOCKED` 表示浏览器/客户端阻断，`NAVIGATION_ERROR_PAGE` 表示其他错误页，`PAGE_NAVIGATION_TIMEOUT` 表示租约到期。前两者的证据来源和归因强度不同；页面级 429 不是 Reddit 服务端限流的确认。
 
 ## 6. 评审重点
 

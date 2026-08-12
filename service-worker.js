@@ -16,27 +16,37 @@ import {
 
 const OUTPUT_LAYER = "raw";
 const WORKER_LOCK_KEY = "reddit-rpa-active-worker-v1";
-const CONTENT_SCRIPT_FILES = ["reddit-dom-selectors.js", "reddit-model.js", "batch-queue.js", "content.js"];
+const CAPTURE_STATE_KEY = "reddit-rpa-capture-state-v1";
+const NAVIGATION_LEASE_KEY = "reddit-rpa-navigation-lease-v1";
+const CONTENT_SCRIPT_FILES = ["reddit-dom-selectors.js", "reddit-model.js", "batch-queue.js", "listing-selection.js", "content.js"];
 const BATCH_EVENT_SCHEMA = "reddit-rpa-batch-event-v1";
 const CONTROL_DIRECTORY = ".reddit-rpa-control";
 const CONTROL_REQUEST_SCHEMA = "reddit-rpa-control-request-v1";
 const CONTROL_RESPONSE_SCHEMA = "reddit-rpa-control-response-v1";
-const CONTROL_COMMANDS = new Set(["prepare", "run", "pause", "resume", "cancel"]);
+const CONTROL_COMMANDS = new Set(["prepare", "run", "retry_unfinished", "pause", "resume", "cancel"]);
 const NATIVE_HOST_NAME = "com.openai.reddit_rpa";
 const NATIVE_REQUEST_TIMEOUT_MS = 10000;
 const COLLECTOR_ID_KEY = "reddit-rpa-native-collector-id-v1";
 const CONTROL_WORK_TAB_KEY = "reddit-rpa-native-control-work-tab-v1";
 const NATIVE_CONTROL_ALARM = "reddit-rpa-native-control-v1";
 const NATIVE_CONTROL_PERIOD_MINUTES = 0.5;
+const NAVIGATION_WATCHDOG_ALARM = "reddit-rpa-navigation-watchdog-v1";
+const NAVIGATION_WATCHDOG_PERIOD_MINUTES = 0.5;
 const BATCH_EVENT_NAMES = new Set([
   "batch_started", "post_navigation_started", "page_ready", "capture_saved",
   "retry", "paused", "resumed", "rate_limited", "rate_limit_cooldown_complete",
-  "permission_required", "batch_finished", "cancelled"
+  "permission_required", "navigation_error_observed", "navigation_timeout", "batch_finished", "cancelled"
 ]);
+const NAVIGATION_FAILURE_KINDS = new Set([
+  "HTTP_429_ERROR_PAGE_OBSERVED", "REDDIT_RATE_LIMIT_PAGE", "CLIENT_BLOCKED",
+  "NAVIGATION_ERROR_PAGE", "PAGE_NAVIGATION_TIMEOUT"
+]);
+const NAVIGATION_EVIDENCE_SOURCES = new Set(["page_dom", "tab_metadata", "background_watchdog"]);
 let controlRequestInFlight = false;
 let nativePort = null;
 let nativeRequestSequence = 0;
 const nativePendingRequests = new Map();
+let navigationLeaseQueue = Promise.resolve();
 
 function outputError(code, message) {
   const error = new Error(message);
@@ -134,6 +144,139 @@ function newWorkerToken() {
 async function activeWorkerLock() {
   const stored = await chrome.storage.session.get(WORKER_LOCK_KEY);
   return stored?.[WORKER_LOCK_KEY] || null;
+}
+
+function validNavigationId(value) {
+  return /^[A-Za-z0-9_.-]+$/.test(String(value || ""));
+}
+
+function validPostFullname(value) {
+  return /^t3_[A-Za-z0-9]+$/i.test(String(value || ""));
+}
+
+function navigationLeaseTimeoutMs(config = {}) {
+  const requested = Number(config?.navigationTimeoutMs ?? config?.progressTimeoutMs);
+  const fallback = 60000;
+  return Math.max(30000, Math.min(300000, Number.isFinite(requested) ? requested : fallback));
+}
+
+function rateLimitCooldownMs(config = {}) {
+  const requested = Number(config?.rateLimitCooldownMs);
+  return Math.max(15000, Math.min(300000, Number.isFinite(requested) ? requested : 60000));
+}
+
+async function activeNavigationLease() {
+  const stored = await chrome.storage.local.get(NAVIGATION_LEASE_KEY);
+  const lease = stored?.[NAVIGATION_LEASE_KEY];
+  return lease && typeof lease === "object" ? lease : null;
+}
+
+async function storeNavigationLease(lease) {
+  await chrome.storage.local.set({ [NAVIGATION_LEASE_KEY]: lease });
+  return lease;
+}
+
+async function clearNavigationLease() {
+  await chrome.storage.local.remove(NAVIGATION_LEASE_KEY);
+}
+
+function serialiseNavigationLease(operation) {
+  const run = navigationLeaseQueue.then(operation, operation);
+  navigationLeaseQueue = run.catch(() => null);
+  return run;
+}
+
+function navigationLeaseMatches(lease, event = {}) {
+  return Boolean(
+    lease
+    && String(lease.batch_id || "") === String(event.batch_id || "")
+    && String(lease.post_fullname || "").toLowerCase() === String(event.post_fullname || "").toLowerCase()
+    && String(lease.navigation_id || "") === String(event.navigation_id || "")
+  );
+}
+
+function navigationFailureFromTab(changeInfo = {}, tab = {}) {
+  const title = String(changeInfo.title ?? tab.title ?? "");
+  const url = String(changeInfo.url ?? tab.url ?? "");
+  const isChromeErrorPage = /^chrome-error:/iu.test(url);
+  if (/\bERR_BLOCKED_BY_CLIENT\b/iu.test(`${title} ${url}`)) {
+    return {
+      failure_kind: "CLIENT_BLOCKED",
+      reason_code: "CLIENT_BLOCKED",
+      reason: "浏览器或本机客户端拦截了工作页请求；未将其归因于 Reddit。",
+      evidence_source: "tab_metadata",
+      displayed_http_status: null,
+      rate_limited: false
+    };
+  }
+  if (/\bHTTP\s+ERROR\s+429\b/iu.test(title) || (isChromeErrorPage && /\b429\b/iu.test(title))) {
+    return {
+      failure_kind: "HTTP_429_ERROR_PAGE_OBSERVED",
+      reason_code: "HTTP_429_ERROR_PAGE_OBSERVED",
+      reason: "浏览器工作页显示 HTTP 429；来源服务端未由本扩展验证。",
+      evidence_source: "tab_metadata",
+      displayed_http_status: 429,
+      rate_limited: true
+    };
+  }
+  if (isChromeErrorPage || /\bHTTP\s+ERROR\s+\d{3}\b/iu.test(title)) {
+    return {
+      failure_kind: "NAVIGATION_ERROR_PAGE",
+      reason_code: "NAVIGATION_ERROR_PAGE",
+      reason: "浏览器工作页显示导航错误；未从页面 DOM 取得可归因的服务端状态。",
+      evidence_source: "tab_metadata",
+      displayed_http_status: null,
+      rate_limited: false
+    };
+  }
+  return null;
+}
+
+function navigationFailureContext(batch, target) {
+  const postFullname = String(target?.post?.fullname || target?.fullname || "");
+  const permalink = String(target?.permalink || target?.post?.canonical_url || "");
+  return {
+    ...(batch?.context || {}),
+    page_type: "thread",
+    source_url: permalink || null,
+    canonical_url: permalink || null,
+    post_fullname: postFullname || null,
+    post_id: postFullname.replace(/^t3_/iu, "") || null
+  };
+}
+
+function navigationFailureEvent(batch, target, lease, failure, observedAt) {
+  const sequence = (Number(batch.event_seq) || 0) + 1;
+  batch.event_seq = sequence;
+  const startedAt = Date.parse(batch.started_at || "");
+  return {
+    schema: BATCH_EVENT_SCHEMA,
+    batch_id: batch.batch_id,
+    seq: sequence,
+    at: observedAt,
+    event: failure.failure_kind === "PAGE_NAVIGATION_TIMEOUT" ? "navigation_timeout" : "navigation_error_observed",
+    post_fullname: target.post?.fullname || target.fullname || null,
+    elapsed_ms: Number.isFinite(startedAt) ? Math.max(0, Date.parse(observedAt) - startedAt) : null,
+    attempt: Number(target.attempts) || 0,
+    reason_code: failure.reason_code,
+    reason: failure.reason,
+    cooldown_ms: failure.cooldown_ms ?? null,
+    navigation_id: lease.navigation_id,
+    failure_kind: failure.failure_kind,
+    evidence_source: failure.evidence_source,
+    displayed_http_status: failure.displayed_http_status ?? null
+  };
+}
+
+function navigationFailureRecord(lease, failure, observedAt) {
+  return {
+    navigation_id: lease.navigation_id,
+    failure_kind: failure.failure_kind,
+    reason_code: failure.reason_code,
+    evidence_source: failure.evidence_source,
+    displayed_http_status: failure.displayed_http_status ?? null,
+    observed_at: observedAt
+  };
 }
 
 async function nativeCollectorId() {
@@ -270,8 +413,16 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   activeWorkerLock().then(async (current) => {
     if (current?.tab_id === tabId) await chrome.storage.session.remove(WORKER_LOCK_KEY);
     if (await rememberedControlWorkTabId() === tabId) await chrome.storage.session.remove(CONTROL_WORK_TAB_KEY);
+    const lease = await activeNavigationLease();
+    if (Number(lease?.tab_id) === Number(tabId)) await clearNavigationLease();
   }).catch(() => { /* 关闭标签页时不影响其他扩展功能。 */ });
 });
+
+if (chrome?.tabs?.onUpdated?.addListener) {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    void observeNavigationTabUpdate(tabId, changeInfo, tab).catch(() => { /* 错误页观测失败不能影响 Chrome 自身导航。 */ });
+  });
+}
 
 async function writeTextFile(fileHandle, text, code, label) {
   let writable;
@@ -640,6 +791,37 @@ async function listKnownPosts(context) {
   return { ok: true, status: "known_posts", subreddit: context.subreddit, posts };
 }
 
+async function listKnownPostFullnames(context) {
+  const native = await nativeHostOperation("list_known_post_fullnames", { context });
+  if (native) return native;
+  const root = await loadWritableOutputRoot();
+  const subreddit = normaliseSubredditName(context?.subreddit);
+  if (!subreddit) throw outputError("SUBREDDIT_NAME_UNAVAILABLE", "当前页面没有可用 subreddit，未读取帖子目录。");
+  const registryState = await readSubredditRegistry(root);
+  const entry = registryState.parsed.entries.find((candidate) => candidate.canonicalName === subreddit.toLowerCase());
+  if (!entry) return { ok: true, status: "known_post_fullnames", subreddit: context?.subreddit || subreddit, post_fullnames: [] };
+  let directory;
+  try {
+    const layer = await root.getDirectoryHandle(OUTPUT_LAYER, { create: false });
+    directory = await layer.getDirectoryHandle(entry.slug, { create: false });
+  } catch (error) {
+    if (error?.name === "NotFoundError") {
+      return { ok: true, status: "known_post_fullnames", subreddit: context?.subreddit || subreddit, post_fullnames: [] };
+    }
+    throw outputError("OUTPUT_READ_FAILED", `无法读取 ${OUTPUT_LAYER}/${entry.slug}：${String(error?.message || error)}`);
+  }
+  const fullnames = new Set();
+  for await (const [_name, handle] of directory.entries()) {
+    if (handle.kind !== "directory") continue;
+    const post = (await readJsonFile(handle, "post.json", { optional: true }))?.post;
+    const fullname = String(post?.fullname || "").trim().toLowerCase();
+    if (post?.subreddit?.toLowerCase() === subreddit.toLowerCase() && /^t3_[a-z0-9]+$/.test(fullname)) {
+      fullnames.add(fullname);
+    }
+  }
+  return { ok: true, status: "known_post_fullnames", subreddit: context?.subreddit || subreddit, post_fullnames: [...fullnames].sort() };
+}
+
 async function validateCommentOwners(context) {
   const native = await nativeHostOperation("validate_comment_owners", { context });
   if (native) return native;
@@ -691,6 +873,8 @@ function batchTargetSummary(target, status) {
     permalink: target?.permalink || null,
     attempts: Number(target?.attempts) || 0,
     rate_limit_failures: Number(target?.rate_limit_failures) || 0,
+    navigation_failures: Number(target?.navigation_failures) || 0,
+    last_failure: target?.last_failure || null,
     status,
     error: target?.error || target?.last_error || null,
     finished_at: target?.finished_at || null
@@ -714,6 +898,8 @@ function batchManifest(batch) {
     selection_mode: batch?.selection_mode || "selected",
     config: batch?.config || {},
     rate_limit: batch?.rate_limit || null,
+    navigation_failure: batch?.navigation_failure || null,
+    recovery: batch?.recovery || null,
     targets: [
       ...(batch?.queue || []).map((target) => batchTargetSummary(target, cancelled ? "unprocessed" : "queued")),
       ...(batch?.current ? [batchTargetSummary(batch.current, cancelled ? "interrupted" : "running")] : []),
@@ -777,6 +963,22 @@ function normaliseBatchEvent(event = {}) {
   if (postFullname && !/^t3_[A-Za-z0-9]+$/i.test(postFullname)) {
     throw outputError("BATCH_EVENT_INVALID", "批次事件的帖子代码无效，未写入事件日志。");
   }
+  const navigationId = event.navigation_id == null ? null : String(event.navigation_id).trim();
+  if (navigationId && !validNavigationId(navigationId)) {
+    throw outputError("BATCH_EVENT_INVALID", "批次事件的导航标识无效，未写入事件日志。");
+  }
+  const failureKind = event.failure_kind == null ? null : String(event.failure_kind).trim();
+  if (failureKind && !NAVIGATION_FAILURE_KINDS.has(failureKind)) {
+    throw outputError("BATCH_EVENT_INVALID", "批次事件的失败分类无效，未写入事件日志。");
+  }
+  const evidenceSource = event.evidence_source == null ? null : String(event.evidence_source).trim();
+  if (evidenceSource && !NAVIGATION_EVIDENCE_SOURCES.has(evidenceSource)) {
+    throw outputError("BATCH_EVENT_INVALID", "批次事件的证据来源无效，未写入事件日志。");
+  }
+  const displayedHttpStatus = event.displayed_http_status == null ? null : Number(event.displayed_http_status);
+  if (displayedHttpStatus != null && (!Number.isInteger(displayedHttpStatus) || displayedHttpStatus < 100 || displayedHttpStatus > 599)) {
+    throw outputError("BATCH_EVENT_INVALID", "批次事件的 HTTP 状态无效，未写入事件日志。");
+  }
   return {
     schema: BATCH_EVENT_SCHEMA,
     event_id: `${batchId}:${sequence}`,
@@ -792,7 +994,11 @@ function normaliseBatchEvent(event = {}) {
     reported_comment_count: Number.isFinite(Number(event.reported_comment_count)) ? Number(event.reported_comment_count) : null,
     collected_comment_count: Number.isFinite(Number(event.collected_comment_count)) ? Number(event.collected_comment_count) : null,
     cooldown_ms: Number.isFinite(Number(event.cooldown_ms)) ? Math.max(0, Math.round(Number(event.cooldown_ms))) : null,
-    tree_diagnostics: normaliseTreeDiagnostics(event.tree_diagnostics)
+    tree_diagnostics: normaliseTreeDiagnostics(event.tree_diagnostics),
+    navigation_id: navigationId,
+    failure_kind: failureKind,
+    evidence_source: evidenceSource,
+    displayed_http_status: displayedHttpStatus
   };
 }
 
@@ -806,6 +1012,250 @@ async function storeBatchEvent({ event }) {
   const filename = `${normalised.batch_id}.events.jsonl`;
   await appendTextFile(batches, filename, serialiseJsonLines([normalised]), `${OUTPUT_LAYER}/batches/${filename}`);
   return { ok: true, status: "batch_event_stored", event: normalised };
+}
+
+function navigationEventConcludesLease(eventName) {
+  return new Set([
+    "page_ready", "capture_saved", "retry", "rate_limited", "navigation_error_observed",
+    "navigation_timeout", "paused", "batch_finished", "cancelled"
+  ]).has(eventName);
+}
+
+async function registerNavigationLease(message, sender) {
+  const batchId = String(message?.batch_id || "").trim();
+  const postFullname = String(message?.post_fullname || "").trim();
+  const navigationId = String(message?.navigation_id || "").trim();
+  const targetUrl = String(message?.target_url || "").trim();
+  if (!validBatchId(batchId) || !validPostFullname(postFullname) || !validNavigationId(navigationId)) {
+    throw outputError("NAVIGATION_LEASE_INVALID", "导航租约缺少有效的批次、帖子或导航标识。")
+  }
+  if (!isRedditTab({ url: targetUrl })) {
+    throw outputError("NAVIGATION_LEASE_INVALID", "导航租约的目标不是 Reddit 帖子页面。")
+  }
+  const timeoutMs = navigationLeaseTimeoutMs({ navigationTimeoutMs: message?.timeout_ms });
+  const startedAt = new Date().toISOString();
+  const lease = {
+    schema: "reddit-rpa-navigation-lease-v1",
+    batch_id: batchId,
+    worker_token: String(message?.worker_token || ""),
+    tab_id: sender?.tab?.id ?? null,
+    post_fullname: postFullname,
+    navigation_id: navigationId,
+    target_url: targetUrl,
+    started_at: startedAt,
+    deadline_at: new Date(Date.now() + timeoutMs).toISOString(),
+    timeout_ms: timeoutMs,
+    phase: "navigating"
+  };
+  return serialiseNavigationLease(async () => {
+    const existing = await activeNavigationLease();
+    if (existing && !navigationLeaseMatches(existing, lease)) {
+      throw outputError("NAVIGATION_LEASE_ACTIVE", "上一条导航尚未得到终态，未开始新的工作页导航。")
+    }
+    await storeNavigationLease(lease);
+    return { ok: true, status: "navigation_lease_started", lease };
+  });
+}
+
+async function clearNavigationLeaseForEvent(event) {
+  if (!navigationEventConcludesLease(event?.event) || !event?.navigation_id) return false;
+  return serialiseNavigationLease(async () => {
+    const lease = await activeNavigationLease();
+    if (!navigationLeaseMatches(lease, event)) return false;
+    await clearNavigationLease();
+    return true;
+  });
+}
+
+async function recordBackgroundNavigationFailure(lease, failure) {
+  return serialiseNavigationLease(async () => {
+    const activeLease = await activeNavigationLease();
+    if (!navigationLeaseMatches(activeLease, lease) || activeLease.phase === "failure_recorded") {
+      return { ok: true, status: "navigation_failure_already_recorded" };
+    }
+    const stored = await chrome.storage.local.get(CAPTURE_STATE_KEY);
+    const state = stored?.[CAPTURE_STATE_KEY];
+    const batch = state?.activeBatchJob;
+    const target = batch?.current;
+    if (!batch?.active || !target || String(batch.batch_id || "") !== lease.batch_id
+      || String(target.post?.fullname || target.fullname || "").toLowerCase() !== lease.post_fullname.toLowerCase()) {
+      await clearNavigationLease();
+      return { ok: true, status: "navigation_lease_stale" };
+    }
+
+    const observedAt = new Date().toISOString();
+    const failureRecord = navigationFailureRecord(lease, failure, observedAt);
+    target.navigation_failures = (Number(target.navigation_failures) || 0) + 1;
+    target.last_failure = failureRecord;
+    target.last_error = failure.reason;
+    batch.navigation_failure = {
+      ...failureRecord,
+      post_fullname: lease.post_fullname,
+      reason: failure.reason
+    };
+    batch.paused = true;
+    state.activeThreadJob = null;
+
+    if (failure.rate_limited) {
+      target.rate_limit_failures = (Number(target.rate_limit_failures) || 0) + 1;
+      const cooldownMs = rateLimitCooldownMs(batch.config);
+      failure.cooldown_ms = cooldownMs;
+      batch.rate_limit = {
+        post_fullname: lease.post_fullname,
+        failure_count: target.rate_limit_failures,
+        reason_code: failure.reason_code,
+        reason: failure.reason,
+        failure_kind: failure.failure_kind,
+        evidence_source: failure.evidence_source,
+        displayed_http_status: failure.displayed_http_status ?? null,
+        cooldown_until: new Date(Date.now() + cooldownMs).toISOString(),
+        outcome: "paused_for_observed_429"
+      };
+      if (target.rate_limit_failures >= 2) {
+        const manual = {
+          ...target,
+          error: failure.reason,
+          finished_at: observedAt
+        };
+        (batch.manual ||= []).push(manual);
+        batch.current = null;
+        batch.rate_limit.outcome = "manual";
+      }
+    }
+
+    const event = navigationFailureEvent(batch, target, lease, failure, observedAt);
+    state.lastResult = {
+      ok: false,
+      code: failure.reason_code,
+      status: failure.rate_limited ? "batch_rate_limit_observed" : "batch_navigation_paused",
+      error: failure.reason,
+      batch: batchManifest(batch)
+    };
+    await chrome.storage.local.set({
+      [CAPTURE_STATE_KEY]: state,
+      [NAVIGATION_LEASE_KEY]: { ...activeLease, phase: "failure_recorded", failure: failureRecord }
+    });
+
+    let audit = null;
+    try {
+      audit = await recordThreadFailure({
+        context: navigationFailureContext(batch, target),
+        target,
+        capture: {
+          capture_id: timestampLabel(),
+          captured_at: observedAt,
+          source_url: target.permalink,
+          coverage_status: failure.rate_limited ? "rate_limited" : "navigation_error",
+          status: "manual",
+          error: failure.reason
+        }
+      });
+    } catch (error) {
+      audit = { ok: false, error: String(error?.message || error) };
+    }
+
+    try {
+      await storeBatchEvent({ event });
+      await storeBatchManifest({ context: batch.context, batch });
+    } catch (error) {
+      state.lastResult = {
+        ...state.lastResult,
+        status: "batch_navigation_paused_persistence_failed",
+        manifest_error: String(error?.message || error)
+      };
+      await chrome.storage.local.set({ [CAPTURE_STATE_KEY]: state });
+    }
+    await clearNavigationLease();
+    return { ...state.lastResult, audit };
+  });
+}
+
+async function processNavigationLease() {
+  const lease = await activeNavigationLease();
+  if (!lease || lease.phase === "failure_recorded") return { ok: true, status: "no_navigation_timeout" };
+  const deadline = Date.parse(lease.deadline_at || "");
+  if (!Number.isFinite(deadline) || deadline > Date.now()) return { ok: true, status: "navigation_pending" };
+  return recordBackgroundNavigationFailure(lease, {
+    failure_kind: "PAGE_NAVIGATION_TIMEOUT",
+    reason_code: "PAGE_NAVIGATION_TIMEOUT",
+    reason: "工作页在导航期限内未恢复为可采集的 Reddit 帖子页。",
+    evidence_source: "background_watchdog",
+    displayed_http_status: null,
+    rate_limited: false
+  });
+}
+
+async function observeNavigationTabUpdate(tabId, changeInfo, tab) {
+  const lease = await activeNavigationLease();
+  if (!lease || lease.phase === "failure_recorded" || Number(lease.tab_id) !== Number(tabId)) return null;
+  const failure = navigationFailureFromTab(changeInfo, tab);
+  if (!failure) return null;
+  return recordBackgroundNavigationFailure(lease, failure);
+}
+
+function recoveryTargetFromManifest(target, subreddit) {
+  const fullname = String(target?.fullname || "").trim();
+  const permalink = String(target?.permalink || "").trim();
+  if (!validPostFullname(fullname) || !permalink) return null;
+  let url;
+  try {
+    url = new URL(permalink);
+  } catch {
+    return null;
+  }
+  const postId = fullname.replace(/^t3_/iu, "");
+  const expectedSubreddit = normaliseSubredditName(subreddit);
+  if (!expectedSubreddit || !isRedditTab({ url: url.href })
+    || !new RegExp(`/r/${expectedSubreddit}/comments/${postId}(?:/|$)`, "iu").test(url.pathname)) return null;
+  return {
+    post: {
+      record_type: "post",
+      fullname,
+      post_fullname: fullname,
+      post_id: postId,
+      subreddit: expectedSubreddit,
+      title: String(target?.title || ""),
+      canonical_url: url.href
+    },
+    permalink: url.href,
+    attempts: 0,
+    recovery_source_status: String(target?.status || "")
+  };
+}
+
+function recoveryTargetsFromManifest(manifest, sourceBatchId) {
+  if (!manifest || manifest.schema !== "reddit-rpa-batch-v1" || String(manifest.batch_id || "") !== String(sourceBatchId || "")) {
+    throw outputError("RECOVERY_SOURCE_INVALID", "源批次清单无效，未创建补采批次。")
+  }
+  const subreddit = normaliseSubredditName(manifest.subreddit);
+  if (!subreddit) throw outputError("RECOVERY_SOURCE_INVALID", "源批次缺少有效 subreddit，未创建补采批次。");
+  const targets = (manifest.targets || [])
+    .filter((target) => ["unprocessed", "interrupted"].includes(String(target?.status || "")))
+    .map((target) => recoveryTargetFromManifest(target, subreddit))
+    .filter(Boolean);
+  const unique = new Map(targets.map((target) => [target.post.fullname.toLowerCase(), target]));
+  return {
+    ok: true,
+    status: "recovery_targets_loaded",
+    source_batch_id: String(sourceBatchId),
+    subreddit,
+    config: manifest.config && typeof manifest.config === "object" ? manifest.config : {},
+    targets: [...unique.values()],
+    recovery_count: unique.size
+  };
+}
+
+async function loadRecoveryTargets(sourceBatchId) {
+  if (!validBatchId(sourceBatchId)) {
+    throw outputError("RECOVERY_SOURCE_INVALID", "源批次 ID 无效，未创建补采批次。");
+  }
+  const native = await nativeHostOperation("load_recovery_targets", { source_batch_id: sourceBatchId });
+  if (native) return native;
+  const root = await loadWritableOutputRoot();
+  const layer = await root.getDirectoryHandle(OUTPUT_LAYER, { create: false });
+  const batches = await layer.getDirectoryHandle("batches", { create: false });
+  const manifest = await readJsonFile(batches, `${sourceBatchId}.json`);
+  return recoveryTargetsFromManifest(manifest, sourceBatchId);
 }
 
 async function controlDirectories(root, { create = false } = {}) {
@@ -845,10 +1295,12 @@ function normaliseControlRequest(request, registryState) {
     command,
     created_at: String(request.created_at || ""),
     batch_id: request.batch_id == null ? null : String(request.batch_id).trim(),
+    source_batch_id: request.source_batch_id == null ? null : String(request.source_batch_id).trim(),
     subreddit: null,
-    count: null
+    count: null,
+    skip_existing: false
   };
-  if (["prepare", "run"].includes(command)) {
+  if (["prepare", "run", "retry_unfinished"].includes(command)) {
     normalised.subreddit = registeredControlSubreddit(request.subreddit, registryState).subreddit;
   }
   if (command === "run") {
@@ -857,9 +1309,16 @@ function normaliseControlRequest(request, registryState) {
       throw outputError("CONTROL_COUNT_INVALID", "控制采集数量必须是 1 到 50 之间的整数，未执行。");
     }
     normalised.count = count;
+    if (request.skip_existing != null && typeof request.skip_existing !== "boolean") {
+      throw outputError("CONTROL_SKIP_EXISTING_INVALID", "skip_existing 必须是布尔值，未执行。")
+    }
+    normalised.skip_existing = request.skip_existing === true;
   }
   if (["pause", "resume", "cancel"].includes(command) && !validBatchId(normalised.batch_id)) {
     throw outputError("CONTROL_BATCH_INVALID", "控制命令缺少有效 batch_id，未执行。");
+  }
+  if (command === "retry_unfinished" && !validBatchId(normalised.source_batch_id)) {
+    throw outputError("RECOVERY_SOURCE_INVALID", "精确补采命令缺少有效源批次 ID，未执行。");
   }
   return normalised;
 }
@@ -931,7 +1390,8 @@ async function writeControlResponse(responses, request, result) {
 function controlCommand(request) {
   const commands = {
     prepare: ["prepareControlPage", { subreddit: request.subreddit }],
-    run: ["runControlledBatch", { subreddit: request.subreddit, count: request.count }],
+    run: ["runControlledBatch", { subreddit: request.subreddit, count: request.count, skip_existing: request.skip_existing }],
+    retry_unfinished: ["retryUnfinishedBatch", { source_batch_id: request.source_batch_id }],
     pause: ["pauseControlledBatch", { batch_id: request.batch_id }],
     resume: ["resumeControlledBatch", { batch_id: request.batch_id }],
     cancel: ["cancelControlledBatch", { batch_id: request.batch_id }]
@@ -1034,7 +1494,7 @@ async function ensureNativeControlWorkTab(request) {
     const redditTabs = tabs.filter(isRedditTab);
     if (redditTabs.length === 1) tab = redditTabs[0];
   }
-  if (!tab && ["prepare", "run"].includes(request.command)) {
+  if (!tab && ["prepare", "run", "retry_unfinished"].includes(request.command)) {
     tab = await chrome.tabs.create({
       url: `https://www.reddit.com/r/${encodeURIComponent(request.subreddit)}/new/`,
       active: false
@@ -1099,16 +1559,25 @@ function scheduleNativeControlLoop() {
   chrome.alarms.create(NATIVE_CONTROL_ALARM, { periodInMinutes: NATIVE_CONTROL_PERIOD_MINUTES });
 }
 
+function scheduleNavigationWatchdog() {
+  if (!chrome?.alarms?.create) return;
+  chrome.alarms.create(NAVIGATION_WATCHDOG_ALARM, { periodInMinutes: NAVIGATION_WATCHDOG_PERIOD_MINUTES });
+  void processNavigationLease();
+}
+
 function startNativeControlLoop() {
   scheduleNativeControlLoop();
+  scheduleNavigationWatchdog();
   void processNativeControlLoop();
 }
 
 if (chrome?.runtime?.onInstalled?.addListener) chrome.runtime.onInstalled.addListener(startNativeControlLoop);
 if (chrome?.runtime?.onStartup?.addListener) chrome.runtime.onStartup.addListener(startNativeControlLoop);
+scheduleNavigationWatchdog();
 if (chrome?.alarms?.onAlarm?.addListener) {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm?.name === NATIVE_CONTROL_ALARM) void processNativeControlLoop();
+    if (alarm?.name === NAVIGATION_WATCHDOG_ALARM) void processNavigationLease();
   });
 }
 
@@ -1185,6 +1654,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "reddit-rpa-list-known-post-fullnames") {
+    if (!isRedditTab(sender?.tab)) {
+      sendResponse({ ok: false, code: "REDDIT_PAGE_REQUIRED", error: "只能从 Reddit 页面读取已有帖子代码。" });
+      return undefined;
+    }
+    listKnownPostFullnames(message.context).then(sendResponse).catch((error) => sendResponse({ ok: false, code: error?.code || "OUTPUT_READ_FAILED", error: String(error?.message || error) }));
+    return true;
+  }
+
   if (message?.type === "reddit-rpa-store-batch") {
     if (!isRedditTab(sender?.tab)) {
       sendResponse({ ok: false, code: "REDDIT_PAGE_REQUIRED", error: "只能从 Reddit 页面写入批次清单。" });
@@ -1194,12 +1672,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "reddit-rpa-navigation-started") {
+    if (!isRedditTab(sender?.tab)) {
+      sendResponse({ ok: false, code: "REDDIT_PAGE_REQUIRED", error: "只能从 Reddit 工作页登记导航租约。" });
+      return undefined;
+    }
+    requireWriteWorker(sender, message.worker_token).then(() => registerNavigationLease(message, sender)).then(sendResponse).catch((error) => sendResponse({ ok: false, code: error?.code || "NAVIGATION_LEASE_FAILED", error: String(error?.message || error) }));
+    return true;
+  }
+
   if (message?.type === "reddit-rpa-store-batch-event") {
     if (!isRedditTab(sender?.tab)) {
       sendResponse({ ok: false, code: "REDDIT_PAGE_REQUIRED", error: "只能从 Reddit 页面写入批次事件。" });
       return undefined;
     }
-    requireWriteWorker(sender, message.worker_token).then(() => storeBatchEvent(message)).then(sendResponse).catch((error) => sendResponse({ ok: false, code: error?.code || "OUTPUT_WRITE_FAILED", error: String(error?.message || error) }));
+    requireWriteWorker(sender, message.worker_token)
+      .then(async () => {
+        const result = await storeBatchEvent(message);
+        await clearNavigationLeaseForEvent(result?.event || message.event);
+        return result;
+      })
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, code: error?.code || "OUTPUT_WRITE_FAILED", error: String(error?.message || error) }));
+    return true;
+  }
+
+  if (message?.type === "reddit-rpa-load-recovery-targets") {
+    if (!isRedditTab(sender?.tab)) {
+      sendResponse({ ok: false, code: "REDDIT_PAGE_REQUIRED", error: "只能从 Reddit 工作页读取精确补采目标。" });
+      return undefined;
+    }
+    loadRecoveryTargets(String(message.source_batch_id || "")).then(sendResponse).catch((error) => sendResponse({ ok: false, code: error?.code || "RECOVERY_SOURCE_UNAVAILABLE", error: String(error?.message || error) }));
     return true;
   }
 

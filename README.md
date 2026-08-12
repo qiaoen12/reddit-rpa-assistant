@@ -1,6 +1,6 @@
 # Reddit RPA Assistant
 
-一个本地运行的 Chrome Manifest V3 Reddit 页面采集与离线处理工具。当前发布快照为 `0.8.0`。
+一个本地运行的 Chrome Manifest V3 Reddit 页面采集与离线处理工具。当前发布快照为 `0.8.2`。
 
 它读取用户已经打开、已经渲染的 Reddit 页面，只保存能够证明属于当前帖子的 Post 和 Comment。它不调用 Reddit API，不读取 Cookie、Local Storage 或登录令牌，也不执行发帖、投票、评论、关注等 Reddit 写操作。
 
@@ -117,6 +117,8 @@ python3 scripts/install_native_host.py --extension-id <chrome-extension-id>
 2. 点击“开始采集 N 帖”，顺序导航同一个 Reddit 工作页并保存快照。
 3. 批次结束后，只对 `manual`、`failed` 和需要完整回复树的 `tree_partial` 项人工复核。
 
+批量导航期间，后台会为每个目标登记限时租约。若浏览器工作页显示 `HTTP ERROR 429`、`ERR_BLOCKED_BY_CLIENT`、其他错误页，或在期限内没有恢复为可采集的 Reddit 帖子页，批次会暂停并写入结构化事件，而不会静默悬挂。`HTTP ERROR 429` 只表示浏览器页面曾显示 429；工具不会将它断言为已验证的 Reddit 服务端限流。
+
 写入完成后，数据形态为：
 
 ```text
@@ -137,15 +139,21 @@ python3 scripts/install_native_host.py --extension-id <chrome-extension-id>
 控制面先读取 Native Host 的在线心跳，再写入集合根目录下的 `.reddit-rpa-control/requests/`。它不修改帖子、评论或 `batch.json`：
 
 ```zsh
-python3 scripts/reddit_rpa_control.py health --root <collection-root>
-python3 scripts/reddit_rpa_control.py prepare --root <collection-root> --subreddit SteamVR --timeout 60
-python3 scripts/reddit_rpa_control.py run --root <collection-root> --subreddit SteamVR --count 25 --timeout 60
-python3 scripts/reddit_rpa_control.py status --root <collection-root> --batch <batch-id>
-python3 scripts/reddit_rpa_control.py tail --root <collection-root> --batch <batch-id>
-python3 scripts/reddit_rpa_control.py verify --root <collection-root> --batch <batch-id>
+python3 scripts/reddit_rpa_control.py --root <collection-root> health
+python3 scripts/reddit_rpa_control.py --root <collection-root> --timeout 60 prepare --subreddit SteamVR
+python3 scripts/reddit_rpa_control.py --root <collection-root> --timeout 60 run --subreddit SteamVR --count 25
+python3 scripts/reddit_rpa_control.py --root <collection-root> --timeout 60 run --subreddit SteamVR --count 25 --skip-existing
+python3 scripts/reddit_rpa_control.py --root <collection-root> --timeout 60 retry-unfinished --batch <source-batch-id>
+python3 scripts/reddit_rpa_control.py --root <collection-root> status --batch <batch-id>
+python3 scripts/reddit_rpa_control.py --root <collection-root> tail --batch <batch-id>
+python3 scripts/reddit_rpa_control.py --root <collection-root> verify --batch <batch-id>
 ```
 
-暂停、继续和取消需要显式 `--batch`。MCP stdio 入口为 `scripts/reddit_rpa_mcp.py`，工具名和参数与 CLI 对齐：`reddit_rpa_health`、`reddit_rpa_prepare`、`reddit_rpa_run`、`reddit_rpa_pause`、`reddit_rpa_resume`、`reddit_rpa_cancel`、`reddit_rpa_status`、`reddit_rpa_tail`、`reddit_rpa_verify`。
+`run --skip-existing`（MCP：`skip_existing: true`）用于高频补采：先只读 `raw/<slug>/*/post.json` 中已有的 `t3_*`，从当前 `/new/` 继续滚动查找，最多检查 500 个候选，直到找到 `count` 个未见帖子；只有同步时新建目录的帖子才会入队。当前列表没有未见帖子时返回 `no_unseen_posts`，不会创建空批次。此选项默认关闭；需要重新采集旧帖的最新评论时，不要传它。
+
+`retry-unfinished --batch <source-batch-id>`（MCP：`reddit_rpa_retry_unfinished`）是精确补采：只读取该历史 `batch.json` 中状态为 `unprocessed` 或 `interrupted` 的 fullname 与 permalink，建立带来源批次血缘的新批次。它不扫描当前 `/new/`，不使用 `skip_existing` 的差集，也不改写源批次；`manual`、`failed` 与 `tree_partial` 仍需按其审计原因处理。
+
+暂停、继续和取消需要显式 `--batch`。MCP stdio 入口为 `scripts/reddit_rpa_mcp.py`，工具名和参数与 CLI 对齐：`reddit_rpa_health`、`reddit_rpa_prepare`、`reddit_rpa_run`、`reddit_rpa_retry_unfinished`、`reddit_rpa_pause`、`reddit_rpa_resume`、`reddit_rpa_cancel`、`reddit_rpa_status`、`reddit_rpa_tail`、`reddit_rpa_verify`。
 
 ## 离线处理脚本
 
@@ -193,7 +201,7 @@ npm test
 git diff --check
 ```
 
-其中 `npm test` 当前包含 35 个 Node 测试和 18 个 Python 测试；测试夹具是合成内容，不读取本地 `VR-XR` 数据。浏览器真实 Reddit 页面、登录状态、MFA、限流和 DOM 变化仍需单独人工验收。
+其中 `npm test` 当前包含 39 个 Node 测试和 28 个 Python 测试；测试夹具是合成内容，不读取本地 `VR-XR` 数据。浏览器真实 Reddit 页面、登录状态、MFA、限流和 DOM 变化仍需单独人工验收。
 
 ## 已知限制与风险
 
@@ -201,11 +209,12 @@ git diff --check
 - Native Host 为本地高权限边界，当前默认绑定本地 `VR-XR` 集合布局；应审查 manifest 路径、扩展 ID 白名单和集合根目录权限。
 - `unlimitedStorage`、`nativeMessaging` 和 Reddit host permissions 都是有意配置，但扩大了浏览器扩展的权限面；不要在不理解代码时加载陌生构建物。
 - 删除/折叠父级、未展开控件、0/0 初次渲染和数量差异会写入质量字段，不能静默升级为 `complete`。
+- 页面级 `HTTP ERROR 429`、浏览器错误页与客户端拦截可由后台观察并暂停批次，但扩展不读取错误页正文，也不能确认 429 一定来自 Reddit 服务端；应以 `failure_kind`、`evidence_source` 和后续可复现实验判断。
 - 本仓库没有云端服务、CI 浏览器 E2E 或自动化账号；任何真实采集结果都必须在本地数据层审计。
 
 ## 版本与发布
 
-Chrome 扩展版本在 `manifest.json`，脚本/MCP 服务信息在 `scripts/reddit_rpa_mcp.py`，当前均为 `0.8.0`。发布前检查：
+Chrome 扩展版本在 `manifest.json`，脚本/MCP 服务信息在 `scripts/reddit_rpa_mcp.py`，当前均为 `0.8.2`。发布前检查：
 
 ```zsh
 git status --short
