@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = "0.7.0";
+  const CONTENT_SCRIPT_VERSION = "0.8.0";
   const CONTENT_SCRIPT_CONTROLLER_KEY = "__redditRpaContentScriptController";
   // 扩展重载会让旧内容脚本的 chrome.runtime 失效，但页面的 isolated
   // world 仍可能保留旧全局变量。新脚本必须接管，而不能被旧布尔标记拦住。

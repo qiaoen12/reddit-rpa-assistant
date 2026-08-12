@@ -28,10 +28,10 @@ async function runtime() {
   let listener = null;
   globalThis.chrome = {
     storage: { session: { get: async () => ({}), set: async () => undefined, remove: async () => undefined } },
-    tabs: { onRemoved: { addListener() {} }, sendMessage: async () => ({ version: "0.7.0" }) },
+    tabs: { onRemoved: { addListener() {} }, sendMessage: async () => ({ version: "0.8.0" }) },
     scripting: { executeScript: async () => undefined },
     runtime: {
-      getManifest: () => ({ version: "0.7.0" }),
+      getManifest: () => ({ version: "0.8.0" }),
       onMessage: { addListener(value) { listener = value; } },
       connectNative: () => nativePort()
     }

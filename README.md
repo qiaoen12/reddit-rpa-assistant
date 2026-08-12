@@ -1,6 +1,6 @@
 # Reddit RPA Assistant
 
-一个本地运行的 Chrome Manifest V3 Reddit 页面采集与离线处理工具。当前发布快照为 `0.7.0`。
+一个本地运行的 Chrome Manifest V3 Reddit 页面采集与离线处理工具。当前发布快照为 `0.8.0`。
 
 它读取用户已经打开、已经渲染的 Reddit 页面，只保存能够证明属于当前帖子的 Post 和 Comment。它不调用 Reddit API，不读取 Cookie、Local Storage 或登录令牌，也不执行发帖、投票、评论、关注等 Reddit 写操作。
 
@@ -20,7 +20,7 @@
 
 - 在一个 Reddit 工作页中同步 `/new/` 列表，并顺序采集固定数量的帖子。
 - 展开英文/中文的更多评论、回复和 `Continue this thread`，生成可审计的评论树快照。
-- 在 `raw-v2/` 中按 subreddit 和稳定的 Reddit Post ID 保存 `post.json`、`comments.jsonl`、`thread.json` 与 `captures.jsonl`。
+- 在 `raw/` 中按 subreddit 和稳定的 Reddit Post ID 保存 `post.json`、`comments.jsonl`、`thread.json` 与 `captures.jsonl`。
 - 通过可选 Native Messaging Host 提供固定集合根目录的原子落盘和批次控制。
 - 通过 CLI 或 stdio MCP 控制已连接的扩展，并返回可供 Agent 分支处理的结构化状态。
 - 将 `thread.json` 合并、清洁、翻译分块，并生成评论树质量复核队列。
@@ -30,7 +30,7 @@
 - 不访问 Reddit API、RSS、Cookie、Local Storage、登录令牌或浏览器密码。
 - 不绕过登录、MFA、验证码、权限、封禁、限流或删除状态；这些情况需要人工恢复。
 - 不把广告、猜测的评论、无法证明归属的回复或未加载内容写入有效快照。
-- 不把历史 `raw/` 记录改写成新的 `raw-v2/` 记录；迁移脚本必须显式执行。
+- 不读取或改写集合的 `frozen/` 历史层；冻结层与活跃采集层严格隔离。
 - 不上传真实采集数据、控制信箱、截图、历史报告或运行缓存。
 
 ## 仓库发布边界
@@ -38,8 +38,8 @@
 本仓库根目录只包含可复现的工具源码、合成测试夹具和文档。以下内容必须留在本地集合或冻结区，不应提交：
 
 ```text
-<collection-root>/raw/                 # 历史原始数据
-<collection-root>/raw-v2/              # 最新采集数据、批次和事件
+<collection-root>/raw/                 # 活跃采集数据、批次和事件
+<collection-root>/frozen/              # 只读历史冻结层
 <collection-root>/clean/               # 清洁/分析产物
 <collection-root>/translated/          # 翻译产物
 <collection-root>/.reddit-rpa-control/ # Native Host 控制信箱
@@ -120,7 +120,7 @@ python3 scripts/install_native_host.py --extension-id <chrome-extension-id>
 写入完成后，数据形态为：
 
 ```text
-<collection-root>/raw-v2/
+<collection-root>/raw/
 ├── batches/<batch-id>.json
 ├── batches/<batch-id>.events.jsonl
 └── <subreddit-slug>/<post-id>--<url-slug>/
@@ -153,7 +153,7 @@ python3 scripts/reddit_rpa_control.py verify --root <collection-root> --batch <b
 
 ```zsh
 python3 scripts/merge_and_summarize.py \
-  --input <collection-root>/raw-v2/virtualreality \
+  --input <collection-root>/raw/virtualreality \
   --out <collection-root>/clean/virtualreality/merge
 
 python3 scripts/build_final_documents.py \
@@ -205,11 +205,11 @@ git diff --check
 
 ## 版本与发布
 
-Chrome 扩展版本在 `manifest.json`，脚本/MCP 服务信息在 `scripts/reddit_rpa_mcp.py`，当前均为 `0.7.0`。发布前检查：
+Chrome 扩展版本在 `manifest.json`，脚本/MCP 服务信息在 `scripts/reddit_rpa_mcp.py`，当前均为 `0.8.0`。发布前检查：
 
 ```zsh
 git status --short
-git ls-files | rg '(^|/)(raw|raw-v2|clean|translated|\.reddit-rpa-control|__pycache__)($|/)|\.pyc$|\.jsonl$'
+git ls-files | rg '(^|/)(raw|frozen|clean|translated|\.reddit-rpa-control|__pycache__)($|/)|\.pyc$|\.jsonl$'
 npm run check && npm test
 ```
 

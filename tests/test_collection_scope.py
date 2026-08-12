@@ -29,18 +29,18 @@ class CollectionScopeTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_checks_only_approved_batch_targets(self) -> None:
-        batches = self.root / "raw-v2" / "batches"
+        batches = self.root / "raw" / "batches"
         batches.mkdir(parents=True)
         (batches / "batch-1.json").write_text(json.dumps({
             "batch_id": "batch-1", "subreddit": "SteamVR", "active": False,
             "targets": [{"fullname": "t3_post", "status": "complete"}],
         }), encoding="utf-8")
-        post_directory = self.root / "raw-v2" / "steamvr" / "post--title"
+        post_directory = self.root / "raw" / "steamvr" / "post--title"
         post_directory.mkdir(parents=True)
         (post_directory / "post.json").write_text(json.dumps({"post": {"fullname": "t3_post", "subreddit": "SteamVR"}}), encoding="utf-8")
         (post_directory / "comments.jsonl").write_text(json.dumps({"record_type": "comment", "fullname": "t1_comment", "post_fullname": "t3_post", "parent_fullname": "t3_post"}) + "\n", encoding="utf-8")
         (post_directory / "captures.jsonl").write_text(json.dumps({"status": "complete"}) + "\n", encoding="utf-8")
-        historical = self.root / "raw-v2" / "other" / "old"
+        historical = self.root / "raw" / "other" / "old"
         historical.mkdir(parents=True)
         (historical / "post.json").write_text(json.dumps({"post": {"fullname": "t3_old", "subreddit": "other"}}), encoding="utf-8")
         (historical / "comments.jsonl").write_text(json.dumps({"record_type": "comment", "fullname": "t1_comment", "post_fullname": "t3_old", "parent_fullname": "t1_comment"}) + "\n", encoding="utf-8")

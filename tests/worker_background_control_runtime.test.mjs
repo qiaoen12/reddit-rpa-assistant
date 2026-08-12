@@ -79,14 +79,14 @@ test("background alarm claims a Native Host command and reuses the sole Reddit w
       },
       sendMessage: async (tabId, message) => {
         sent.push({ tabId, message });
-        if (message.command === "status") return { version: "0.7.0" };
+        if (message.command === "status") return { version: "0.8.0" };
         return { ok: true, status: "control_preparing", subreddit: message.subreddit };
       }
     },
     scripting: { executeScript: async () => undefined },
     alarms: { create() {}, onAlarm },
     runtime: {
-      getManifest: () => ({ version: "0.7.0" }),
+      getManifest: () => ({ version: "0.8.0" }),
       onMessage,
       onInstalled,
       onStartup,

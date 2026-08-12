@@ -1,6 +1,6 @@
 {
   "name": "reddit-rpa-assistant",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A local Manifest V3 Reddit page collector with auditable offline processing tools.",
   "private": true,
   "type": "module",

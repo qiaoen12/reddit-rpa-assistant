@@ -26,7 +26,7 @@ CONTROL_DIRECTORY = ".reddit-rpa-control"
 REQUEST_SCHEMA = "reddit-rpa-control-request-v1"
 RESPONSE_SCHEMA = "reddit-rpa-control-response-v1"
 COLLECTOR_SCHEMA = "reddit-rpa-collector-v1"
-OUTPUT_LAYER = "raw-v2"
+OUTPUT_LAYER = "raw"
 COMMANDS = {"prepare", "run", "pause", "resume", "cancel"}
 CONTROL_CLAIM_LEASE_SECONDS = 90
 EVENTS = {
@@ -406,7 +406,7 @@ class CollectionStore:
         self.atomic_write(path, write_jsonl(rows))
         return {"ok": True, "status": "batch_event_stored", "event": event}
 
-    def posts_in_layer(self, directory: Path, layer: str, entry: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
+    def posts_in_layer(self, directory: Path, entry: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
         if not directory.exists():
             return []
         posts: list[dict[str, Any]] = []
@@ -418,17 +418,14 @@ class CollectionStore:
             if not isinstance(post, dict) or as_text(post.get("subreddit")).lower() != as_text(context.get("subreddit")).lower():
                 continue
             thread = self.read_json(post_directory / "thread.json", optional=True) or {}
-            posts.append({"directory_name": post_directory.name, "relativePath": f"{layer}/{entry['slug']}/{post_directory.name}", "layer": layer, "post": post, "permalink": post.get("canonical_url"), "captured_at": thread.get("last_captured_at"), "known_comment_count": len(thread.get("comments") or []), "capture_count": count(thread.get("capture_count")), "last_status": (thread.get("latest_capture") or {}).get("status")})
+            posts.append({"directory_name": post_directory.name, "relativePath": f"{OUTPUT_LAYER}/{entry['slug']}/{post_directory.name}", "layer": OUTPUT_LAYER, "post": post, "permalink": post.get("canonical_url"), "captured_at": thread.get("last_captured_at"), "known_comment_count": len(thread.get("comments") or []), "capture_count": count(thread.get("capture_count")), "last_status": (thread.get("latest_capture") or {}).get("status")})
         return posts
 
     def list_known_posts(self, payload: dict[str, Any]) -> dict[str, Any]:
         context = payload.get("context") or {}
         entry = self.registry_entry(context)
-        by_fullname: dict[str, dict[str, Any]] = {}
-        for layer in ("raw", OUTPUT_LAYER):
-            for item in self.posts_in_layer(self.root / layer / entry["slug"], layer, entry, context):
-                by_fullname[as_text(item["post"].get("fullname")).lower()] = item
-        posts = sorted(by_fullname.values(), key=lambda item: (as_text(item.get("captured_at")), as_text((item.get("post") or {}).get("title"))), reverse=True)
+        posts = self.posts_in_layer(self.root / OUTPUT_LAYER / entry["slug"], entry, context)
+        posts.sort(key=lambda item: (as_text(item.get("captured_at")), as_text((item.get("post") or {}).get("title"))), reverse=True)
         return {"ok": True, "status": "known_posts", "subreddit": context.get("subreddit"), "posts": posts}
 
     def validate_comment_owners(self, _payload: dict[str, Any]) -> dict[str, Any]:

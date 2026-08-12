@@ -42,7 +42,7 @@ class NativeHostTests(unittest.TestCase):
             "context": self.context, "records": [self.post, comment],
             "capture": {"capture_id": "capture", "captured_at": "2026-08-11T00:01:00.000Z", "status": "complete", "tree_diagnostics": {"deleted_placeholder_count": 1, "reason_codes": ["DELETED_ANCESTOR_OBSERVED"]}},
         })
-        directory = self.root / "raw-v2" / "steamvr" / "abc123--post"
+        directory = self.root / "raw" / "steamvr" / "abc123--post"
         capture = json.loads((directory / "captures.jsonl").read_text(encoding="utf-8"))
         thread = json.loads((directory / "thread.json").read_text(encoding="utf-8"))
 
@@ -51,12 +51,12 @@ class NativeHostTests(unittest.TestCase):
         self.assertEqual(stored["new_comment_count"], 1)
         self.assertEqual(capture["tree_diagnostics"]["deleted_placeholder_count"], 1)
         self.assertEqual(thread["comments"][0]["fullname"], "t1_def456")
-        self.assertFalse((self.root.parent / "raw-v2").exists())
+        self.assertFalse((self.root / "raw-v2").exists())
 
     def test_claims_one_targeted_control_request_and_preserves_structured_error_responses(self) -> None:
         collector_id = "collector-p8"
         heartbeat = self.store.handle("write_collector_heartbeat", {
-            "collector_id": collector_id, "version": "0.7.0", "state": "ready",
+            "collector_id": collector_id, "version": "0.8.0", "state": "ready",
             "work_tab_id": 19, "work_url": "https://www.reddit.com/r/SteamVR/new/",
         })
         request_path = self.root / HOST.CONTROL_DIRECTORY / "requests" / "request-1.json"
@@ -77,6 +77,19 @@ class NativeHostTests(unittest.TestCase):
         self.assertFalse(written["ok"])
         self.assertEqual(json.loads(response_path.read_text(encoding="utf-8"))["code"], "WORK_PAGE_REQUIRED")
         self.assertFalse((self.root / HOST.CONTROL_DIRECTORY / "claims" / "request-1.json").exists())
+
+    def test_lists_only_active_raw_posts(self) -> None:
+        self.store.handle("sync_posts", {"context": self.context, "records": [self.post], "capturedAt": "2026-08-11T00:00:00.000Z"})
+        frozen = self.root / "frozen" / "raw-v1-2026-08-11" / "steamvr" / "def456--frozen"
+        frozen.mkdir(parents=True)
+        (frozen / "post.json").write_text(json.dumps({"post": {
+            "fullname": "t3_def456", "subreddit": "SteamVR", "title": "Frozen", "canonical_url": "https://www.reddit.com/r/SteamVR/comments/def456/frozen/",
+        }}), encoding="utf-8")
+
+        known = self.store.handle("list_known_posts", {"context": self.context})
+
+        self.assertEqual([item["post"]["fullname"] for item in known["posts"]], ["t3_abc123"])
+        self.assertEqual([item["layer"] for item in known["posts"]], ["raw"])
 
     def test_rejects_unlisted_native_operations(self) -> None:
         with self.assertRaises(HOST.HostError) as raised:

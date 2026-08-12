@@ -3,7 +3,7 @@
 
 It deliberately contains no browser, API, credential, or data-writing logic.
 The Chrome extension remains the sole DOM collector; the optional Native Host
-performs fixed-root raw-v2 writes.
+performs fixed-root raw writes.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any
 from reddit_rpa_control import ControlError, command_result, default_root
 
 
-SERVER_INFO = {"name": "reddit-rpa-control", "version": "0.7.0"}
+SERVER_INFO = {"name": "reddit-rpa-control", "version": "0.8.0"}
 TOOLS = [
     {
         "name": "reddit_rpa_health",

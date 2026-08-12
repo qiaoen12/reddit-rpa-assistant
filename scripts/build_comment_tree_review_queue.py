@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""从 raw-v2 的最新 capture 生成只读的评论树质量复核队列。"""
+"""从 raw/ 的最新 capture 生成只读的评论树质量复核队列。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ from collections import Counter
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+OUTPUT_LAYER = "raw"
 
 
 REVIEW_STATUSES = {"tree_partial", "manual", "failed"}
@@ -94,7 +97,7 @@ def scoped_posts(root: Path, scope_path: Path | None) -> set[tuple[str, str]] | 
     scope = read_json(scope_path)
     allowed: set[tuple[str, str]] = set()
     for batch_id in scope.get("approved_batch_ids", []):
-        batch = read_json(root / "raw-v2" / "batches" / f"{batch_id}.json")
+        batch = read_json(root / OUTPUT_LAYER / "batches" / f"{batch_id}.json")
         subreddit = str((batch or {}).get("subreddit") or "").lower()
         for target in (batch or {}).get("targets", []):
             if isinstance(target, dict) and target.get("fullname"):
@@ -103,7 +106,7 @@ def scoped_posts(root: Path, scope_path: Path | None) -> set[tuple[str, str]] | 
 
 
 def queue_items(root: Path, scope_path: Path | None = None) -> list[dict[str, Any]]:
-    layer = root / "raw-v2"
+    layer = root / OUTPUT_LAYER
     if not layer.exists():
         return []
     allowed_posts = scoped_posts(root, scope_path)
@@ -180,7 +183,7 @@ def markdown(items: list[dict[str, Any]], generated_at: str, categories: dict[st
         "",
         f"生成时间：{generated_at}",
         "",
-        f"共 {len(items)} 项；此队列只引用 capture 与永久链接，不包含 Comment 正文，也不回写 `raw-v2/`。",
+        f"共 {len(items)} 项；此队列只引用 capture 与永久链接，不包含 Comment 正文，也不回写 `raw/`。",
         "",
         "- 分组："
         f"`manual` {categories['manual']}，`tree_partial` {categories['tree_partial']}，"
@@ -221,7 +224,7 @@ def build_queue(root: Path, output_directory: Path, queue_date: str, scope_path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="生成 raw-v2 的只读评论树质量复核队列")
+    parser = argparse.ArgumentParser(description="生成 raw 的只读评论树质量复核队列")
     parser.add_argument("--root", type=Path, default=default_root(), help="VR-XR 集合目录")
     parser.add_argument("--out", type=Path, default=None, help="输出目录，默认 insights/quality")
     parser.add_argument("--scope", type=Path, required=True, help="正式批次范围文件；必须显式指定，避免混入历史批次")

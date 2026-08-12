@@ -14,8 +14,7 @@ import {
   registerSubredditInRegistry
 } from "./subreddit-registry.mjs";
 
-const OUTPUT_LAYER = "raw-v2";
-const LEGACY_OUTPUT_LAYER = "raw";
+const OUTPUT_LAYER = "raw";
 const WORKER_LOCK_KEY = "reddit-rpa-active-worker-v1";
 const CONTENT_SCRIPT_FILES = ["reddit-dom-selectors.js", "reddit-model.js", "batch-queue.js", "content.js"];
 const BATCH_EVENT_SCHEMA = "reddit-rpa-batch-event-v1";
@@ -371,9 +370,9 @@ async function subredditOutput(context) {
   try {
     const layer = await root.getDirectoryHandle(OUTPUT_LAYER, { create: true });
     const directory = await layer.getDirectoryHandle(entry.slug, { create: true });
-    return { root, entry, directory, autoRegistered, layer: OUTPUT_LAYER };
+    return { root, entry, directory, autoRegistered };
   } catch (error) {
-    throw outputError("OUTPUT_DIRECTORY_UNAVAILABLE", `无法创建修订版 subreddit 目录：${String(error?.message || error)}`);
+    throw outputError("OUTPUT_DIRECTORY_UNAVAILABLE", `无法创建采集 subreddit 目录：${String(error?.message || error)}`);
   }
 }
 
@@ -381,7 +380,7 @@ async function postOutput(context, post) {
   const subreddit = await subredditOutput(context);
   let location;
   try {
-    location = postDirectory(subreddit.entry, post, { layer: subreddit.layer });
+    location = postDirectory(subreddit.entry, post);
   } catch (error) {
     if (error instanceof OutputPathError) throw outputError(error.code, error.message);
     throw error;
@@ -609,17 +608,7 @@ async function recordThreadFailure({ context, target, capture = {} }) {
   return { ok: true, status: "thread_failure_recorded", relativePath: output.relativeDirectory, capture: captureRecord };
 }
 
-async function existingSubredditDirectory(root, layerName, slug) {
-  try {
-    const layer = await root.getDirectoryHandle(layerName, { create: false });
-    return await layer.getDirectoryHandle(slug, { create: false });
-  } catch (error) {
-    if (error?.name === "NotFoundError") return null;
-    throw outputError("OUTPUT_READ_FAILED", `无法读取 ${layerName}/${slug}：${String(error?.message || error)}`);
-  }
-}
-
-async function postsInLayer(directory, layerName, output, context) {
+async function postsInLayer(directory, output, context) {
   if (!directory) return [];
   const posts = [];
   for await (const [name, handle] of directory.entries()) {
@@ -629,8 +618,8 @@ async function postsInLayer(directory, layerName, output, context) {
     const thread = await readJsonFile(handle, "thread.json", { optional: true });
     posts.push({
       directory_name: name,
-      relativePath: `${layerName}/${output.entry.slug}/${name}`,
-      layer: layerName,
+      relativePath: `${OUTPUT_LAYER}/${output.entry.slug}/${name}`,
+      layer: OUTPUT_LAYER,
       post: postDocument.post,
       permalink: postDocument.post.canonical_url,
       captured_at: thread?.last_captured_at || null,
@@ -646,15 +635,7 @@ async function listKnownPosts(context) {
   const native = await nativeHostOperation("list_known_posts", { context });
   if (native) return native;
   const output = await subredditOutput(context);
-  const legacyDirectory = await existingSubredditDirectory(output.root, LEGACY_OUTPUT_LAYER, output.entry.slug);
-  const [legacyPosts, revisedPosts] = await Promise.all([
-    postsInLayer(legacyDirectory, LEGACY_OUTPUT_LAYER, output, context),
-    postsInLayer(output.directory, OUTPUT_LAYER, output, context)
-  ]);
-  const byFullname = new Map();
-  for (const post of legacyPosts) byFullname.set(post.post.fullname.toLowerCase(), post);
-  for (const post of revisedPosts) byFullname.set(post.post.fullname.toLowerCase(), post);
-  const posts = [...byFullname.values()];
+  const posts = await postsInLayer(output.directory, output, context);
   posts.sort((left, right) => (right.captured_at || "").localeCompare(left.captured_at || "") || String(left.post.title || "").localeCompare(String(right.post.title || "")));
   return { ok: true, status: "known_posts", subreddit: context.subreddit, posts };
 }

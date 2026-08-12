@@ -23,7 +23,7 @@ class CommentTreeReviewQueueTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def write_capture(self, directory_name: str, capture: dict) -> None:
-        directory = self.root / "raw-v2" / "steamvr" / directory_name
+        directory = self.root / "raw" / "steamvr" / directory_name
         directory.mkdir(parents=True)
         (directory / "post.json").write_text(json.dumps({"post": {
             "fullname": f"t3_{directory_name}",
@@ -31,7 +31,7 @@ class CommentTreeReviewQueueTests(unittest.TestCase):
         }}), encoding="utf-8")
         (directory / "captures.jsonl").write_text(json.dumps(capture) + "\n", encoding="utf-8")
 
-    def test_builds_deduplicated_actionable_queue_without_touching_raw_v2(self) -> None:
+    def test_builds_deduplicated_actionable_queue_without_touching_raw(self) -> None:
         self.write_capture("manual", {
             "status": "manual", "coverage_status": "retry", "reported_comment_count": 5,
             "collected_comment_count": 0, "comment_count_gap": 5, "quality": {"unknown_parent_comment": 0},
@@ -67,7 +67,8 @@ class CommentTreeReviewQueueTests(unittest.TestCase):
         self.assertEqual(rows[2]["coverage_status"], "complete_with_reported_count_gap")
         markdown = Path(result["markdown_path"]).read_text(encoding="utf-8")
         self.assertIn("`complete_with_reported_count_gap` 1", markdown)
-        self.assertFalse((self.root / "raw").exists())
+        self.assertTrue((self.root / "raw").is_dir())
+        self.assertFalse((self.root / "raw-v2").exists())
 
 
 if __name__ == "__main__":

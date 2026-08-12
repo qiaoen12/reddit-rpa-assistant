@@ -24,11 +24,11 @@ test("builds the required persistent post directory", () => {
       urlSlug: "found_at_goodwill_for_199",
       directoryName: "1upfiqa--found_at_goodwill_for_199",
       canonicalUrl: "https://www.reddit.com/r/SteamVR/comments/1upfiqa/found_at_goodwill_for_199/",
-      relativeDirectory: "raw-v2/steamvr/1upfiqa--found_at_goodwill_for_199"
+      relativeDirectory: "raw/steamvr/1upfiqa--found_at_goodwill_for_199"
     }
   );
   assert.equal(
-    postDirectory({ slug: "steamvr" }, post, { layer: "raw" }).relativeDirectory,
+    postDirectory({ slug: "steamvr" }, post, { layer: "frozen" }).relativeDirectory,
     "raw/steamvr/1upfiqa--found_at_goodwill_for_199"
   );
 });

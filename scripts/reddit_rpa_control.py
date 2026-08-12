@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reddit RPA 的薄控制面：写命令信箱，读取批次与事件日志。
 
-此脚本不连接 Chrome、不调用 Reddit，也不会改写 raw-v2 的采集文件。
+此脚本不连接 Chrome、不调用 Reddit，也不会改写 raw/ 的采集文件。
 唯一的写入是 VR-XR/.reddit-rpa-control/ 下的请求文件；当前唯一 Reddit
 工作页读取该请求并执行既有 DOM 采集路径。Native Host 已安装时由它回写
 控制响应与采集数据，未安装时保留 File System Access 回退路径。
@@ -21,6 +21,7 @@ from typing import Any
 
 
 CONTROL_DIRECTORY = ".reddit-rpa-control"
+OUTPUT_LAYER = "raw"
 REQUEST_SCHEMA = "reddit-rpa-control-request-v1"
 RESPONSE_SCHEMA = "reddit-rpa-control-response-v1"
 COLLECTOR_SCHEMA = "reddit-rpa-collector-v1"
@@ -244,7 +245,7 @@ def submit_request(root: Path, request: dict[str, Any], *, timeout_seconds: floa
 def batch_path(root: Path, batch_id: str) -> Path:
     if not valid_batch_id(batch_id):
         raise ControlError("batch_id 无效。")
-    return root / "raw-v2" / "batches" / f"{batch_id}.json"
+    return root / OUTPUT_LAYER / "batches" / f"{batch_id}.json"
 
 
 def batch_status(root: Path, batch_id: str) -> dict[str, Any]:
@@ -273,7 +274,7 @@ def batch_status(root: Path, batch_id: str) -> dict[str, Any]:
 
 
 def tail_events(root: Path, batch_id: str, *, limit: int = 20) -> dict[str, Any]:
-    events = json_lines(root / "raw-v2" / "batches" / f"{batch_id}.events.jsonl")
+    events = json_lines(root / OUTPUT_LAYER / "batches" / f"{batch_id}.events.jsonl")
     return {
         "ok": True,
         "status": "batch_events",
@@ -287,7 +288,7 @@ def verify_batch(root: Path, batch_id: str) -> dict[str, Any]:
     batch = read_json(batch_path(root, batch_id))
     targets = [target for target in batch.get("targets", []) if isinstance(target, dict)]
     terminal = [target for target in targets if str(target.get("status") or "") in TERMINAL_STATUSES]
-    layer = root / "raw-v2"
+    layer = root / OUTPUT_LAYER
     owners: dict[str, str] = {}
     duplicate_ids: set[str] = set()
     self_parent_count = 0
@@ -345,7 +346,7 @@ def verify_batch(root: Path, batch_id: str) -> dict[str, Any]:
 
 
 def wait_for_started_batch(root: Path, subreddit: str, not_before: float, timeout_seconds: float) -> dict[str, Any] | None:
-    directory = root / "raw-v2" / "batches"
+    directory = root / OUTPUT_LAYER / "batches"
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     while time.monotonic() <= deadline:
         if directory.exists():

@@ -8,7 +8,7 @@
 
 ~~~text
 <collection-root>/
-├── raw/                              # 旧数据层；只读保留
+├── raw/                              # 唯一活跃采集层
 └── rules/subreddit_registry.json    # 允许的 subreddit 与安全目录 slug
 ~~~
 
@@ -16,7 +16,7 @@
 
 ~~~text
 <collection-root>/
-├── raw-v2/
+├── raw/
 │   ├── batches/
 │   └── <subreddit-slug>/<post-id>--<url-slug>/
 └── .reddit-rpa-control/
@@ -62,7 +62,7 @@ rules/subreddit_registry.json 由集合维护者提供。工具只在页面能�
 ## 4. Post 目录与快照文件
 
 ~~~text
-raw-v2/<subreddit-slug>/<post-id>--<url-slug>/
+raw/<subreddit-slug>/<post-id>--<url-slug>/
 ├── post.json
 ├── comments.jsonl
 ├── thread.json
@@ -75,7 +75,7 @@ raw-v2/<subreddit-slug>/<post-id>--<url-slug>/
 
 ### comments.jsonl
 
-保存当前采集修订的完整评论快照，每行一个 Comment JSON 对象。它按稳定 fullname 去重，不能把历史 raw/ 评论盲目追加进去，也不能用同一行承载无法证明归属的多个候选。
+保存当前采集修订的完整评论快照，每行一个 Comment JSON 对象。它按稳定 fullname 去重，不能从冻结层盲目追加历史评论，也不能用同一行承载无法证明归属的多个候选。
 
 ### thread.json
 
@@ -95,7 +95,7 @@ raw-v2/<subreddit-slug>/<post-id>--<url-slug>/
 
 ## 5. 批次与控制信箱
 
-raw-v2/batches/<batch-id>.json 固定本次目标 Post 的 t3_... 身份；批次事件文件只追加。CLI/MCP 只在以下目录写入控制面：
+raw/batches/<batch-id>.json 固定本次目标 Post 的 t3_... 身份；批次事件文件只追加。CLI/MCP 只在以下目录写入控制面：
 
 ~~~text
 <collection-root>/.reddit-rpa-control/
@@ -116,15 +116,15 @@ raw-v2/batches/<batch-id>.json 固定本次目标 Post 的 t3_... 身份；批�
 - 采集时间/发布日期（若页面提供）；
 - 可用的 schema、质量状态和错误原因。
 
-历史 raw/ 层不由正常采集流程改写。旧 runs/ 的迁移是唯一例外，必须先演练、再显式传入 --apply；如果使用 --trash-runs，报告应保留迁移来源、目标和校验信息。
+`frozen/` 是历史证据的只读归档层，正常采集、清洁、翻译与分析均不得读取或改写它。旧 runs/ 的迁移是唯一例外，必须先演练、再显式传入 --apply；如果使用 --trash-runs，报告应保留迁移来源、目标和校验信息。
 
 ## 7. 发布隔离
 
-仓库不包含任何 raw/、raw-v2/、clean/、translated/ 或控制信箱文件。即使这些文件是 JSON/JSONL，也属于数据资产，不是测试 fixture。提交前应同时检查：
+仓库不包含任何 raw/、frozen/、clean/、translated/ 或控制信箱文件。即使这些文件是 JSON/JSONL，也属于数据资产，不是测试 fixture。提交前应同时检查：
 
 ~~~zsh
 git ls-files
-git ls-files | rg '(^|/)(raw|raw-v2|clean|translated|\.reddit-rpa-control)($|/)|\.jsonl$'
+git ls-files | rg '(^|/)(raw|frozen|clean|translated|\.reddit-rpa-control)($|/)|\.jsonl$'
 ~~~
 
 第二条只允许命中明确的合成测试夹具或源码中的格式样例；真实帖子、评论、批次和事件必须为零。

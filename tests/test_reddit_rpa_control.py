@@ -39,7 +39,7 @@ class RedditRpaControlTests(unittest.TestCase):
 
     def write_batch(self, targets: list[dict]) -> str:
         batch_id = "2026-08-10_120000_001"
-        directory = self.root / "raw-v2" / "batches"
+        directory = self.root / "raw" / "batches"
         directory.mkdir(parents=True)
         (directory / f"{batch_id}.json").write_text(json.dumps({
             "schema": "reddit-rpa-batch-v1",
@@ -54,7 +54,7 @@ class RedditRpaControlTests(unittest.TestCase):
         return batch_id
 
     def write_post(self, directory_name: str, post_fullname: str, comments: list[dict], gap: int = 0) -> None:
-        directory = self.root / "raw-v2" / "steamvr" / directory_name
+        directory = self.root / "raw" / "steamvr" / directory_name
         directory.mkdir(parents=True)
         (directory / "post.json").write_text(json.dumps({"post": {"fullname": post_fullname}}), encoding="utf-8")
         (directory / "comments.jsonl").write_text("".join(json.dumps(item) + "\n" for item in comments), encoding="utf-8")
@@ -78,7 +78,7 @@ class RedditRpaControlTests(unittest.TestCase):
         self.assertEqual(result["code"], "NATIVE_HOST_REQUIRED")
         request_path = self.root / CONTROL_DIRECTORY / "requests" / f"{request['request_id']}.json"
         self.assertFalse(request_path.exists())
-        self.assertFalse((self.root / "raw-v2").exists(), "the CLI must not create or modify collector output")
+        self.assertFalse((self.root / "raw").exists(), "the CLI must not create or modify collector output")
 
     def test_online_collector_is_selected_before_the_control_request_is_written(self) -> None:
         self.write_collector()
@@ -107,7 +107,7 @@ class RedditRpaControlTests(unittest.TestCase):
         }
         self.write_post("a", "t3_a", [shared], gap=1)
         self.write_post("b", "t3_b", [{**shared, "parent_fullname": "t3_a"}])
-        event_path = self.root / "raw-v2" / "batches" / f"{batch_id}.events.jsonl"
+        event_path = self.root / "raw" / "batches" / f"{batch_id}.events.jsonl"
         event_path.write_text(json.dumps({"event": "batch_started", "batch_id": batch_id}) + "\n", encoding="utf-8")
 
         status = batch_status(self.root, batch_id)

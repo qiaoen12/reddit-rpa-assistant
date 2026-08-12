@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Reddit 本地采集助手",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "低介入、单工作页的 Reddit 页面帖子与评论树采集、展开和本地导出工具；不使用 API、令牌或后台抓取。",
   "permissions": ["activeTab", "alarms", "scripting", "storage", "tabs", "unlimitedStorage", "nativeMessaging"],
   "host_permissions": ["https://www.reddit.com/*", "https://reddit.com/*"],

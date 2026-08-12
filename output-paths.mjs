@@ -1,6 +1,7 @@
 const SUBREDDIT_SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const POST_ID_PATTERN = /^[a-z0-9]+$/i;
 const REDDIT_HOSTS = new Set(["reddit.com", "www.reddit.com"]);
+const OUTPUT_LAYER = "raw";
 
 export class OutputPathError extends Error {
   constructor(code, message) {
@@ -68,7 +69,7 @@ export function postPermalinkDetails(value, expectedPostId) {
   };
 }
 
-export function postDirectory(entry, post, { layer = "raw-v2" } = {}) {
+export function postDirectory(entry, post) {
   const subredditSlug = String(entry?.slug || "").trim();
   if (!SUBREDDIT_SLUG_PATTERN.test(subredditSlug)) {
     throw new OutputPathError("SUBREDDIT_SLUG_UNAVAILABLE", "subreddit 目录名无效，未写入任何文件。");
@@ -76,10 +77,6 @@ export function postDirectory(entry, post, { layer = "raw-v2" } = {}) {
   const postId = normalisePostId(post?.post_id || post?.id || post?.fullname || post?.post_fullname);
   const permalink = post?.canonical_url || post?.source_url || post?.source_url_or_raw_path;
   const details = postPermalinkDetails(permalink, postId);
-  const outputLayer = String(layer || "").trim();
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(outputLayer)) {
-    throw new OutputPathError("OUTPUT_LAYER_UNAVAILABLE", "输出层目录名无效，未写入任何文件。");
-  }
   const directoryName = `${details.postId}--${details.urlSlug}`;
   return {
     slug: subredditSlug,
@@ -87,7 +84,7 @@ export function postDirectory(entry, post, { layer = "raw-v2" } = {}) {
     urlSlug: details.urlSlug,
     directoryName,
     canonicalUrl: details.canonicalUrl,
-    relativeDirectory: `${outputLayer}/${subredditSlug}/${directoryName}`
+    relativeDirectory: `${OUTPUT_LAYER}/${subredditSlug}/${directoryName}`
   };
 }
 

@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 
 
+OUTPUT_LAYER = "raw"
+
+
 TERMINAL = {"complete", "tree_partial", "manual", "failed", "interrupted"}
 
 
@@ -51,7 +54,7 @@ def scope_expectations(scope: dict[str, Any]) -> dict[str, int]:
 
 def post_directories(root: Path, expected: set[tuple[str, str]]) -> dict[tuple[str, str], Path]:
     found: dict[tuple[str, str], Path] = {}
-    layer = root / "raw-v2"
+    layer = root / OUTPUT_LAYER
     for subreddit in layer.iterdir() if layer.exists() else []:
         if not subreddit.is_dir() or subreddit.name == "batches":
             continue
@@ -78,7 +81,7 @@ def verify_scope(root: Path, scope_path: Path) -> dict[str, Any]:
     terminal_counts: Counter[str] = Counter()
     expected_targets: set[tuple[str, str]] = set()
     batch_summaries: list[dict[str, Any]] = []
-    batches_root = root / "raw-v2" / "batches"
+    batches_root = root / OUTPUT_LAYER / "batches"
     for batch_id in batch_ids:
         path = batches_root / f"{batch_id}.json"
         if not path.exists():

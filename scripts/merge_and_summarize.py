@@ -258,7 +258,7 @@ def write_summary(path: Path, records: list[dict[str, Any]], quality: dict[str, 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="合并 Reddit RPA 帖子评论树并生成确定性统计")
-    parser.add_argument("--input", type=Path, required=True, help="单个 thread.json，或包含帖子目录的 raw-v2/<subreddit> 目录")
+    parser.add_argument("--input", type=Path, required=True, help="单个 thread.json，或包含帖子目录的 raw/<subreddit> 目录")
     parser.add_argument("--out", type=Path, required=True, help="输出目录，通常位于 clean/<subreddit>/")
     parser.add_argument("--prefix", default="", help="可选文件名前缀，例如 2026-08-07_120000_000_")
     return parser.parse_args(argv)

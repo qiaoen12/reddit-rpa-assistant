@@ -15,7 +15,7 @@ flowchart LR
     CTRL --> SW
     SW --> CS
     CS --> REDDIT["已打开的 Reddit 页面"]
-    RAW["raw-v2/ 快照"] --> OFFLINE["离线处理脚本"]
+    RAW["raw/ 快照"] --> OFFLINE["离线处理脚本"]
     OFFLINE --> CLEAN["clean/、translated/、质量队列"]
 ~~~
 
@@ -28,10 +28,10 @@ flowchart LR
 | 扩展 UI | popup.html、popup.js、popup.css | 启动同步/采集、显示批次状态、请求目录授权 | 直接解析全页 DOM、调用 Reddit 网络接口 |
 | 内容脚本 | content.js、reddit-model.js、reddit-dom-selectors.js | 读取当前页面已渲染节点、展开控件、证明 Post/Comment 归属、提交结构化消息 | 直接写任意本地路径、读取凭据、并行控制多个工作页 |
 | 后台 Service Worker | service-worker.js、batch-queue.js | 单工作页锁、队列、导航、重试、权限预检、写入路由、Native Host 桥接 | 通过 fetch 访问 Reddit API、猜测缺失评论 |
-| 浏览器回退写入 | output-store.js、output-paths.mjs、post-storage.mjs | 使用用户授予的目录句柄、校验安全目录名、原子落盘 | 选择用户未授权的目录、覆盖历史 raw/ |
+| 浏览器回退写入 | output-store.js、output-paths.mjs、post-storage.mjs | 使用用户授予的目录句柄、校验安全目录名、原子落盘 | 选择用户未授权的目录、访问冻结层 |
 | Native Host | native-host/reddit_rpa_native_host.py | 校验请求、固定集合根目录、原子写入、维护控制信箱 | 接收任意扩展传入的路径、打开网页、启动 HTTP 服务 |
 | 控制面 | scripts/reddit_rpa_control.py、scripts/reddit_rpa_mcp.py | 读取心跳/状态、写入结构化控制请求、返回结构化错误 | 直接驱动 DOM、改写帖子/评论或伪造完成状态 |
-| 离线处理 | scripts/*.py 中的合并/翻译/质量脚本 | 显式输入到显式输出、保留来源 ID/永久链接 | 联网采集、修改 raw-v2/（迁移脚本除外且需显式确认） |
+| 离线处理 | scripts/*.py 中的合并/翻译/质量脚本 | 显式输入到显式输出、保留来源 ID/永久链接 | 联网采集、修改 raw/（迁移脚本除外且需显式确认） |
 
 ## 3. 批次控制时序
 
@@ -49,7 +49,7 @@ sequenceDiagram
     W->>P: 复用或创建唯一工作页
     P->>W: 页面就绪、批次进度、质量状态
     W->>H: 结构化写入请求
-    H->>D: 校验路径并原子写入 raw-v2
+    H->>D: 校验路径并原子写入 raw
     W->>D: File System Access 回退路径（无 Host 时）
     W-->>A: status / tail / verify 可读状态
 ~~~

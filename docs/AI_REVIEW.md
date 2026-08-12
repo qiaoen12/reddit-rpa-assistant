@@ -53,7 +53,7 @@
 | Worker → File System Access | 授权失效、错误目录、半写入 | root preflight、raw/rules 目录检查、临时文件/原子替换 |
 | Worker ↔ Native Host | 任意路径、未授权扩展、重复 claim | manifest allowed origins、固定 root、ID 正则、claim lease |
 | CLI/MCP → Control inbox | 命令伪造、重放、数据面误写 | schema/ID 校验、在线 collector 选择、只写 request |
-| raw-v2 → 派生层 | 误删或覆盖原始快照 | 显式输入/输出、快照替换语义、迁移需 --apply |
+| raw → 派生层 | 误删或覆盖原始快照 | 显式输入/输出、快照替换语义、迁移需 --apply |
 
 ## 4. 状态审查规则
 
@@ -82,7 +82,7 @@ git diff --check
 ~~~zsh
 git status --short
 git ls-files
-git ls-files | rg '(^|/)(raw|raw-v2|clean|translated|\.reddit-rpa-control|__pycache__)($|/)|\.pyc$|\.jsonl$'
+git ls-files | rg '(^|/)(raw|frozen|clean|translated|\.reddit-rpa-control|__pycache__)($|/)|\.pyc$|\.jsonl$'
 ~~~
 
 对于真实环境，额外需要人工验证：

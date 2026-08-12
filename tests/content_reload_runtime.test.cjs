@@ -80,7 +80,7 @@ test("takes over a page whose old extension script left the legacy loaded flag b
   injectCurrentScripts(runtime);
   await flushMicrotasks();
 
-  assert.equal(runtime.sandbox.__redditRpaContentScriptLoaded, "0.7.0");
+  assert.equal(runtime.sandbox.__redditRpaContentScriptLoaded, "0.8.0");
   assert.equal(runtime.listeners.size, 1, "the current script must install a usable command listener");
   assert.equal(runtime.timers.size, 3, "the current script should retain its watcher, hydration timer and control poller");
 

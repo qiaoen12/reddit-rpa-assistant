@@ -1,7 +1,6 @@
 # 本地采集集合与运行产物：永远不应进入工具仓库。
 VR-XR/
 raw/
-raw-v2/
 clean/
 translated/
 .reddit-rpa-control/
