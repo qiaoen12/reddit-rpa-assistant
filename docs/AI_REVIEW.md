@@ -19,9 +19,9 @@
 | 顺序 | 文件 | 关注问题 |
 | --- | --- | --- |
 | 1 | manifest.json | host permissions、nativeMessaging、unlimitedStorage 和入口 |
-| 2 | content.js | DOM 读取、控件展开、工作页控制、错误/重试状态 |
+| 2 | collector-config.js、content-page-context.js、content-record-extractor.js、content-command-registry.js、content.js | 默认参数、页面上下文、DOM 记录提取、命令分派、控件展开、工作页控制、错误/重试状态 |
 | 3 | reddit-model.js | Post/Comment 识别、永久链接、父级和自指循环 |
-| 4 | service-worker.js | 单工作页锁、目录授权、批次写入、扩展重载恢复 |
+| 4 | service-worker.js、navigation-lease.mjs、batch-event-contract.mjs、native-host-client.mjs | 单工作页锁、导航归类、事件契约、Native Messaging 与扩展重载恢复 |
 | 5 | native-host/reddit_rpa_native_host.py | 固定根目录、请求校验、原子写入和 Native Messaging 协议 |
 | 6 | output-paths.mjs、post-storage.mjs | 路径与 schema 不变量 |
 | 7 | scripts/reddit_rpa_control.py、scripts/reddit_rpa_mcp.py | 控制信箱和结构化错误 |

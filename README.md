@@ -12,9 +12,10 @@
 
 1. [AI 评审指南](docs/AI_REVIEW.md)：范围、信任边界、风险和验收清单。
 2. [架构说明](docs/ARCHITECTURE.md)：浏览器、Native Host、CLI/MCP 和文件层之间的调用关系。
-3. [数据契约](docs/DATA_CONTRACT.md)：目录、记录类型、快照语义和不可变字段。
-4. `service-worker.js`、`content.js`、`native-host/reddit_rpa_native_host.py`：核心写入与采集边界。
-5. `tests/`：不依赖本地真实数据的 Node/Python 合成测试。
+3. [模块地图](docs/MODULE_MAP.md)：面向后续开发与 AI 审计的入口、依赖和变更落点。
+4. [数据契约](docs/DATA_CONTRACT.md)：目录、记录类型、快照语义和不可变字段。
+5. `collector-config.js`、`service-worker.js`、`content.js`、`native-host/reddit_rpa_native_host.py`：核心配置、写入与采集边界。
+6. `tests/`：不依赖本地真实数据的 Node/Python 合成测试。
 
 ## 能做什么
 
@@ -24,6 +25,15 @@
 - 通过可选 Native Messaging Host 提供固定集合根目录的原子落盘和批次控制。
 - 通过 CLI 或 stdio MCP 控制已连接的扩展，并返回可供 Agent 分支处理的结构化状态。
 - 将 `thread.json` 合并、清洁、翻译分块，并生成评论树质量复核队列。
+
+## 0.8.2 的维护性边界
+
+- `collector-config.js` 统一弹窗和内容脚本的默认采集参数；参数跨越 UI、页面和后台边界时仍会分别做范围校验。
+- `content-page-context.js`、`content-record-extractor.js` 与 `content-command-registry.js` 分别负责页面身份、DOM 到已验证记录的转换和命令分派；`content.js` 只保留页面生命周期与批次状态机。
+- `native-host-client.mjs`、`navigation-lease.mjs` 与 `batch-event-contract.mjs` 从 Service Worker 拆出高权限传输、导航错误归类和批次事件契约；Worker 继续负责副作用与恢复编排。
+- `retry-unfinished` 只复制源批次中 `unprocessed` / `interrupted` 目标；`manual`、`failed` 与 `tree_partial` 保留审计状态，不能被自动升级为 `complete`。
+
+完整的文件职责、调用方向与新增功能落点见 [模块地图](docs/MODULE_MAP.md)。
 
 ## 明确不做什么
 
@@ -56,7 +66,14 @@ __pycache__/、*.pyc、.DS_Store          # 生成物
 ├── manifest.json                 # Chrome MV3 权限和入口
 ├── popup.html / popup.js / popup.css
 ├── content.js                    # 唯一 DOM 采集控制器
+├── collector-config.js            # 弹窗/内容脚本共享的默认采集参数
+├── content-page-context.js        # 内容脚本的 URL、上下文与轻量 DOM 取值规则
+├── content-record-extractor.js    # DOM 到已验证 Post/Comment 记录的提取边界
+├── content-command-registry.js   # 内容脚本命令与失败审计分类
 ├── service-worker.js             # 状态、写入、批次与 Native Host 桥接
+├── native-host-client.mjs         # Native Messaging 连接、超时与响应关联
+├── navigation-lease.mjs           # 导航租约校验、失败归类与审计事件组装
+├── batch-event-contract.mjs       # 批次事件 schema 校验与归一化
 ├── reddit-model.js               # Post/Comment 识别、归属和父级校验
 ├── post-storage.mjs              # post/thread/capture 数据契约
 ├── output-paths.mjs              # 安全目录名与路径边界
@@ -201,7 +218,7 @@ npm test
 git diff --check
 ```
 
-其中 `npm test` 当前包含 39 个 Node 测试和 28 个 Python 测试；测试夹具是合成内容，不读取本地 `VR-XR` 数据。浏览器真实 Reddit 页面、登录状态、MFA、限流和 DOM 变化仍需单独人工验收。
+其中 `npm test` 当前包含 58 个 Node 测试和 28 个 Python 测试；测试夹具是合成内容，不读取本地 `VR-XR` 数据。浏览器真实 Reddit 页面、登录状态、MFA、限流和 DOM 变化仍需单独人工验收。
 
 ## 已知限制与风险
 

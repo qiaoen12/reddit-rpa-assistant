@@ -1,4 +1,21 @@
 import { loadWritableOutputRoot, outputRootStatus } from "./output-store.js";
+import { createNativeHostClient } from "./native-host-client.mjs";
+import {
+  navigationEventConcludesLease,
+  normaliseBatchEvent,
+  validBatchId
+} from "./batch-event-contract.mjs";
+import {
+  navigationFailureContext,
+  navigationFailureEvent,
+  navigationFailureFromTab,
+  navigationFailureRecord,
+  navigationLeaseMatches,
+  navigationLeaseTimeoutMs,
+  rateLimitCooldownMs,
+  validNavigationId,
+  validPostFullname
+} from "./navigation-lease.mjs";
 import { OutputPathError, postDirectory, resolvePostDirectoryName } from "./output-paths.mjs";
 import {
   buildThreadDocument,
@@ -18,7 +35,7 @@ const OUTPUT_LAYER = "raw";
 const WORKER_LOCK_KEY = "reddit-rpa-active-worker-v1";
 const CAPTURE_STATE_KEY = "reddit-rpa-capture-state-v1";
 const NAVIGATION_LEASE_KEY = "reddit-rpa-navigation-lease-v1";
-const CONTENT_SCRIPT_FILES = ["reddit-dom-selectors.js", "reddit-model.js", "batch-queue.js", "listing-selection.js", "content.js"];
+const CONTENT_SCRIPT_FILES = ["collector-config.js", "reddit-dom-selectors.js", "reddit-model.js", "batch-queue.js", "listing-selection.js", "content-page-context.js", "content-record-extractor.js", "content-command-registry.js", "content.js"];
 const BATCH_EVENT_SCHEMA = "reddit-rpa-batch-event-v1";
 const CONTROL_DIRECTORY = ".reddit-rpa-control";
 const CONTROL_REQUEST_SCHEMA = "reddit-rpa-control-request-v1";
@@ -32,21 +49,12 @@ const NATIVE_CONTROL_ALARM = "reddit-rpa-native-control-v1";
 const NATIVE_CONTROL_PERIOD_MINUTES = 0.5;
 const NAVIGATION_WATCHDOG_ALARM = "reddit-rpa-navigation-watchdog-v1";
 const NAVIGATION_WATCHDOG_PERIOD_MINUTES = 0.5;
-const BATCH_EVENT_NAMES = new Set([
-  "batch_started", "post_navigation_started", "page_ready", "capture_saved",
-  "retry", "paused", "resumed", "rate_limited", "rate_limit_cooldown_complete",
-  "permission_required", "navigation_error_observed", "navigation_timeout", "batch_finished", "cancelled"
-]);
-const NAVIGATION_FAILURE_KINDS = new Set([
-  "HTTP_429_ERROR_PAGE_OBSERVED", "REDDIT_RATE_LIMIT_PAGE", "CLIENT_BLOCKED",
-  "NAVIGATION_ERROR_PAGE", "PAGE_NAVIGATION_TIMEOUT"
-]);
-const NAVIGATION_EVIDENCE_SOURCES = new Set(["page_dom", "tab_metadata", "background_watchdog"]);
 let controlRequestInFlight = false;
-let nativePort = null;
-let nativeRequestSequence = 0;
-const nativePendingRequests = new Map();
 let navigationLeaseQueue = Promise.resolve();
+const nativeHostClient = createNativeHostClient({
+  hostName: NATIVE_HOST_NAME,
+  timeoutMs: NATIVE_REQUEST_TIMEOUT_MS
+});
 
 function outputError(code, message) {
   const error = new Error(message);
@@ -54,77 +62,7 @@ function outputError(code, message) {
   return error;
 }
 
-function nativeHostError(code, message) {
-  const error = new Error(message);
-  error.code = code;
-  return error;
-}
-
-function rejectNativePending(error) {
-  for (const pending of nativePendingRequests.values()) {
-    clearTimeout(pending.timer);
-    pending.reject(error);
-  }
-  nativePendingRequests.clear();
-}
-
-function connectNativeHost() {
-  if (nativePort) return nativePort;
-  if (typeof chrome?.runtime?.connectNative !== "function") {
-    throw nativeHostError("NATIVE_HOST_UNAVAILABLE", "Chrome Native Messaging Host 尚未安装。");
-  }
-  const port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
-  port.onMessage.addListener((response) => {
-    const requestId = String(response?.request_id || "");
-    const pending = nativePendingRequests.get(requestId);
-    if (!pending) return;
-    nativePendingRequests.delete(requestId);
-    clearTimeout(pending.timer);
-    pending.resolve(response);
-  });
-  port.onDisconnect.addListener(() => {
-    const message = chrome.runtime.lastError?.message || "Chrome Native Messaging Host 不可用。";
-    if (nativePort === port) nativePort = null;
-    rejectNativePending(nativeHostError("NATIVE_HOST_UNAVAILABLE", message));
-  });
-  nativePort = port;
-  return port;
-}
-
-function nativeHostRequest(operation, payload = {}) {
-  let port;
-  try {
-    port = connectNativeHost();
-  } catch (error) {
-    return Promise.reject(error);
-  }
-  const requestId = `${Date.now()}-${++nativeRequestSequence}`;
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      nativePendingRequests.delete(requestId);
-      reject(nativeHostError("NATIVE_HOST_TIMEOUT", "Native Host 在 10 秒内没有返回结果。"));
-    }, NATIVE_REQUEST_TIMEOUT_MS);
-    nativePendingRequests.set(requestId, { resolve, reject, timer });
-    try {
-      port.postMessage({ request_id: requestId, operation, payload });
-    } catch (error) {
-      nativePendingRequests.delete(requestId);
-      clearTimeout(timer);
-      reject(nativeHostError("NATIVE_HOST_UNAVAILABLE", String(error?.message || error)));
-    }
-  });
-}
-
-async function nativeHostOperation(operation, payload = {}) {
-  try {
-    const response = await nativeHostRequest(operation, payload);
-    const { request_id: _requestId, ...result } = response || {};
-    return result;
-  } catch (error) {
-    if (error?.code === "NATIVE_HOST_UNAVAILABLE") return null;
-    throw error;
-  }
-}
+const nativeHostOperation = (operation, payload = {}) => nativeHostClient.operation(operation, payload);
 
 function registryOutputError(error) {
   if (error instanceof SubredditRegistryError) return outputError(error.code, error.message);
@@ -146,25 +84,6 @@ async function activeWorkerLock() {
   return stored?.[WORKER_LOCK_KEY] || null;
 }
 
-function validNavigationId(value) {
-  return /^[A-Za-z0-9_.-]+$/.test(String(value || ""));
-}
-
-function validPostFullname(value) {
-  return /^t3_[A-Za-z0-9]+$/i.test(String(value || ""));
-}
-
-function navigationLeaseTimeoutMs(config = {}) {
-  const requested = Number(config?.navigationTimeoutMs ?? config?.progressTimeoutMs);
-  const fallback = 60000;
-  return Math.max(30000, Math.min(300000, Number.isFinite(requested) ? requested : fallback));
-}
-
-function rateLimitCooldownMs(config = {}) {
-  const requested = Number(config?.rateLimitCooldownMs);
-  return Math.max(15000, Math.min(300000, Number.isFinite(requested) ? requested : 60000));
-}
-
 async function activeNavigationLease() {
   const stored = await chrome.storage.local.get(NAVIGATION_LEASE_KEY);
   const lease = stored?.[NAVIGATION_LEASE_KEY];
@@ -184,99 +103,6 @@ function serialiseNavigationLease(operation) {
   const run = navigationLeaseQueue.then(operation, operation);
   navigationLeaseQueue = run.catch(() => null);
   return run;
-}
-
-function navigationLeaseMatches(lease, event = {}) {
-  return Boolean(
-    lease
-    && String(lease.batch_id || "") === String(event.batch_id || "")
-    && String(lease.post_fullname || "").toLowerCase() === String(event.post_fullname || "").toLowerCase()
-    && String(lease.navigation_id || "") === String(event.navigation_id || "")
-  );
-}
-
-function navigationFailureFromTab(changeInfo = {}, tab = {}) {
-  const title = String(changeInfo.title ?? tab.title ?? "");
-  const url = String(changeInfo.url ?? tab.url ?? "");
-  const isChromeErrorPage = /^chrome-error:/iu.test(url);
-  if (/\bERR_BLOCKED_BY_CLIENT\b/iu.test(`${title} ${url}`)) {
-    return {
-      failure_kind: "CLIENT_BLOCKED",
-      reason_code: "CLIENT_BLOCKED",
-      reason: "浏览器或本机客户端拦截了工作页请求；未将其归因于 Reddit。",
-      evidence_source: "tab_metadata",
-      displayed_http_status: null,
-      rate_limited: false
-    };
-  }
-  if (/\bHTTP\s+ERROR\s+429\b/iu.test(title) || (isChromeErrorPage && /\b429\b/iu.test(title))) {
-    return {
-      failure_kind: "HTTP_429_ERROR_PAGE_OBSERVED",
-      reason_code: "HTTP_429_ERROR_PAGE_OBSERVED",
-      reason: "浏览器工作页显示 HTTP 429；来源服务端未由本扩展验证。",
-      evidence_source: "tab_metadata",
-      displayed_http_status: 429,
-      rate_limited: true
-    };
-  }
-  if (isChromeErrorPage || /\bHTTP\s+ERROR\s+\d{3}\b/iu.test(title)) {
-    return {
-      failure_kind: "NAVIGATION_ERROR_PAGE",
-      reason_code: "NAVIGATION_ERROR_PAGE",
-      reason: "浏览器工作页显示导航错误；未从页面 DOM 取得可归因的服务端状态。",
-      evidence_source: "tab_metadata",
-      displayed_http_status: null,
-      rate_limited: false
-    };
-  }
-  return null;
-}
-
-function navigationFailureContext(batch, target) {
-  const postFullname = String(target?.post?.fullname || target?.fullname || "");
-  const permalink = String(target?.permalink || target?.post?.canonical_url || "");
-  return {
-    ...(batch?.context || {}),
-    page_type: "thread",
-    source_url: permalink || null,
-    canonical_url: permalink || null,
-    post_fullname: postFullname || null,
-    post_id: postFullname.replace(/^t3_/iu, "") || null
-  };
-}
-
-function navigationFailureEvent(batch, target, lease, failure, observedAt) {
-  const sequence = (Number(batch.event_seq) || 0) + 1;
-  batch.event_seq = sequence;
-  const startedAt = Date.parse(batch.started_at || "");
-  return {
-    schema: BATCH_EVENT_SCHEMA,
-    batch_id: batch.batch_id,
-    seq: sequence,
-    at: observedAt,
-    event: failure.failure_kind === "PAGE_NAVIGATION_TIMEOUT" ? "navigation_timeout" : "navigation_error_observed",
-    post_fullname: target.post?.fullname || target.fullname || null,
-    elapsed_ms: Number.isFinite(startedAt) ? Math.max(0, Date.parse(observedAt) - startedAt) : null,
-    attempt: Number(target.attempts) || 0,
-    reason_code: failure.reason_code,
-    reason: failure.reason,
-    cooldown_ms: failure.cooldown_ms ?? null,
-    navigation_id: lease.navigation_id,
-    failure_kind: failure.failure_kind,
-    evidence_source: failure.evidence_source,
-    displayed_http_status: failure.displayed_http_status ?? null
-  };
-}
-
-function navigationFailureRecord(lease, failure, observedAt) {
-  return {
-    navigation_id: lease.navigation_id,
-    failure_kind: failure.failure_kind,
-    reason_code: failure.reason_code,
-    evidence_source: failure.evidence_source,
-    displayed_http_status: failure.displayed_http_status ?? null,
-    observed_at: observedAt
-  };
 }
 
 async function nativeCollectorId() {
@@ -917,7 +743,7 @@ async function storeBatchManifest({ context, batch }) {
   if (native) return native;
   const output = await subredditOutput(context || batch?.context);
   const manifest = batchManifest(batch);
-  if (!/^[A-Za-z0-9_.-]+$/.test(manifest.batch_id)) {
+  if (!validBatchId(manifest.batch_id)) {
     throw outputError("BATCH_ID_INVALID", "批次 ID 无效，未写入批次清单。");
   }
   const layer = await output.root.getDirectoryHandle(OUTPUT_LAYER, { create: true });
@@ -932,93 +758,21 @@ async function storeBatchManifest({ context, batch }) {
   return { ok: true, status: "batch_manifest_stored", relativePath, manifest };
 }
 
-function validBatchId(value) {
-  return /^[A-Za-z0-9_.-]+$/.test(String(value || ""));
-}
-
-function normaliseTreeDiagnostics(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const count = (field) => Math.max(0, Math.floor(Number(value[field]) || 0));
-  return {
-    deleted_placeholder_count: count("deleted_placeholder_count"),
-    removed_placeholder_count: count("removed_placeholder_count"),
-    collapsed_placeholder_count: count("collapsed_placeholder_count"),
-    unmapped_native_parent_path_count: count("unmapped_native_parent_path_count"),
-    reason_codes: [...new Set((value.reason_codes || []).map((code) => String(code || "").trim()).filter(Boolean))]
-  };
-}
-
 function validControlRequestId(value) {
   return /^[A-Za-z0-9_.-]+$/.test(String(value || ""));
 }
 
-function normaliseBatchEvent(event = {}) {
-  const batchId = String(event.batch_id || "").trim();
-  const eventName = String(event.event || "").trim();
-  const sequence = Number(event.seq);
-  if (!validBatchId(batchId)) throw outputError("BATCH_ID_INVALID", "批次事件缺少有效 batch_id，未写入事件日志。");
-  if (!BATCH_EVENT_NAMES.has(eventName)) throw outputError("BATCH_EVENT_INVALID", "批次事件类型无效，未写入事件日志。");
-  if (!Number.isInteger(sequence) || sequence < 1) throw outputError("BATCH_EVENT_INVALID", "批次事件缺少有效序号，未写入事件日志。");
-  const postFullname = event.post_fullname == null ? null : String(event.post_fullname);
-  if (postFullname && !/^t3_[A-Za-z0-9]+$/i.test(postFullname)) {
-    throw outputError("BATCH_EVENT_INVALID", "批次事件的帖子代码无效，未写入事件日志。");
-  }
-  const navigationId = event.navigation_id == null ? null : String(event.navigation_id).trim();
-  if (navigationId && !validNavigationId(navigationId)) {
-    throw outputError("BATCH_EVENT_INVALID", "批次事件的导航标识无效，未写入事件日志。");
-  }
-  const failureKind = event.failure_kind == null ? null : String(event.failure_kind).trim();
-  if (failureKind && !NAVIGATION_FAILURE_KINDS.has(failureKind)) {
-    throw outputError("BATCH_EVENT_INVALID", "批次事件的失败分类无效，未写入事件日志。");
-  }
-  const evidenceSource = event.evidence_source == null ? null : String(event.evidence_source).trim();
-  if (evidenceSource && !NAVIGATION_EVIDENCE_SOURCES.has(evidenceSource)) {
-    throw outputError("BATCH_EVENT_INVALID", "批次事件的证据来源无效，未写入事件日志。");
-  }
-  const displayedHttpStatus = event.displayed_http_status == null ? null : Number(event.displayed_http_status);
-  if (displayedHttpStatus != null && (!Number.isInteger(displayedHttpStatus) || displayedHttpStatus < 100 || displayedHttpStatus > 599)) {
-    throw outputError("BATCH_EVENT_INVALID", "批次事件的 HTTP 状态无效，未写入事件日志。");
-  }
-  return {
-    schema: BATCH_EVENT_SCHEMA,
-    event_id: `${batchId}:${sequence}`,
-    seq: sequence,
-    at: String(event.at || new Date().toISOString()),
-    batch_id: batchId,
-    event: eventName,
-    post_fullname: postFullname,
-    elapsed_ms: Number.isFinite(Number(event.elapsed_ms)) ? Math.max(0, Math.round(Number(event.elapsed_ms))) : null,
-    attempt: Number.isFinite(Number(event.attempt)) ? Math.max(0, Math.floor(Number(event.attempt))) : null,
-    reason_code: event.reason_code == null ? null : String(event.reason_code),
-    reason: event.reason == null ? null : String(event.reason),
-    reported_comment_count: Number.isFinite(Number(event.reported_comment_count)) ? Number(event.reported_comment_count) : null,
-    collected_comment_count: Number.isFinite(Number(event.collected_comment_count)) ? Number(event.collected_comment_count) : null,
-    cooldown_ms: Number.isFinite(Number(event.cooldown_ms)) ? Math.max(0, Math.round(Number(event.cooldown_ms))) : null,
-    tree_diagnostics: normaliseTreeDiagnostics(event.tree_diagnostics),
-    navigation_id: navigationId,
-    failure_kind: failureKind,
-    evidence_source: evidenceSource,
-    displayed_http_status: displayedHttpStatus
-  };
-}
-
 async function storeBatchEvent({ event }) {
-  const native = await nativeHostOperation("store_batch_event", { event });
+  // 在将事件交给任意写入后端前先校验；Native Host 仍会再次校验其进程边界。
+  const normalised = normaliseBatchEvent(event, { schema: BATCH_EVENT_SCHEMA });
+  const native = await nativeHostOperation("store_batch_event", { event: normalised });
   if (native) return native;
-  const normalised = normaliseBatchEvent(event);
   const root = await loadWritableOutputRoot();
   const layer = await root.getDirectoryHandle(OUTPUT_LAYER, { create: true });
   const batches = await layer.getDirectoryHandle("batches", { create: true });
   const filename = `${normalised.batch_id}.events.jsonl`;
   await appendTextFile(batches, filename, serialiseJsonLines([normalised]), `${OUTPUT_LAYER}/batches/${filename}`);
   return { ok: true, status: "batch_event_stored", event: normalised };
-}
-
-function navigationEventConcludesLease(eventName) {
-  return new Set([
-    "page_ready", "capture_saved", "retry", "rate_limited", "navigation_error_observed",
-    "navigation_timeout", "paused", "batch_finished", "cancelled"
-  ]).has(eventName);
 }
 
 async function registerNavigationLease(message, sender) {
@@ -1123,7 +877,15 @@ async function recordBackgroundNavigationFailure(lease, failure) {
       }
     }
 
-    const event = navigationFailureEvent(batch, target, lease, failure, observedAt);
+    const event = navigationFailureEvent({
+      batchEventSchema: BATCH_EVENT_SCHEMA,
+      batch,
+      target,
+      lease,
+      failure,
+      observedAt
+    });
+    batch.event_seq = event.seq;
     state.lastResult = {
       ok: false,
       code: failure.reason_code,

@@ -8,7 +8,9 @@
   } catch {
     // 旧扩展上下文已失效时，清理动作可能不可用；新控制器仍应接管页面。
   }
-  globalThis.__redditRpaContentScriptLoaded = CONTENT_SCRIPT_VERSION;
+  // 旧版本用此标记阻止重复注入；现在以可释放的 controller 为唯一真相。
+  // 清除遗留标记，避免它被误解为仍在使用的生命周期状态。
+  delete globalThis.__redditRpaContentScriptLoaded;
 
   const STATE_KEY = "reddit-rpa-capture-state-v1";
   const MAX_THREAD_EXPANSION_PASSES = 14;
@@ -17,26 +19,51 @@
   const CONTROL_POLL_INTERVAL_MS = 1000;
   const RATE_LIMIT_PAGE_TEXT = /(?:you(?:'|’)ve been doing that a lot|whoa there, pardner|too many requests|rate limit(?:ed)?|try again later)/iu;
   const HTTP_429_PAGE_TEXT = /\bHTTP\s+ERROR\s+429\b/iu;
-  const DEFAULT_CONFIG = {
-    listingSteps: 25,
-    targetPostCount: 25,
-    maxPosts: 25,
-    scrollPercent: 85,
-    waitMs: 1500,
-    expansionPasses: 10,
-    navigationJitterMs: 750,
-    progressTimeoutMs: 45000,
-    navigationTimeoutMs: 60000,
-    rateLimitCooldownMs: 60000
-  };
+  const collectorConfig = globalThis.RedditRpaCollectorConfig;
   const model = globalThis.RedditRpaModel;
   const selectors = globalThis.RedditRpaDomSelectors;
   const batchQueue = globalThis.RedditRpaBatchQueue;
   const listingSelection = globalThis.RedditRpaListingSelection;
-  if (!model || !selectors || !batchQueue || !listingSelection) {
+  const pageContextModule = globalThis.RedditRpaPageContext;
+  const recordExtractorModule = globalThis.RedditRpaRecordExtractor;
+  const commandRegistryModule = globalThis.RedditRpaCommandRegistry;
+  if (!collectorConfig?.DEFAULT_CONFIG || !model || !selectors || !batchQueue || !listingSelection
+    || typeof pageContextModule?.create !== "function" || typeof recordExtractorModule?.create !== "function"
+    || typeof commandRegistryModule?.create !== "function") {
     console.error("Reddit RPA 页面采集依赖未加载。");
     return;
   }
+  const { DEFAULT_CONFIG } = collectorConfig;
+  const pageContext = pageContextModule.create({
+    model,
+    documentRef: document,
+    locationRef: location,
+    URLCtor: URL
+  });
+  const {
+    normalisedPageUrl,
+    textOf,
+    attributeOf,
+    absoluteUrl,
+    firstText,
+    subredditFromDocument,
+    currentContext,
+    contextsMatch,
+    postContextsMatch,
+    threadTargetContext
+  } = pageContext;
+  const {
+    thingFullname,
+    postNodes,
+    collectListing,
+    collectThread,
+    mergeListingRecords
+  } = recordExtractorModule.create({
+    model,
+    selectors,
+    documentRef: document,
+    pageContext
+  });
 
   const state = {
     records: [],
@@ -186,107 +213,6 @@
     const suffix = globalThis.crypto?.randomUUID?.().replace(/-/g, "").slice(0, 10)
       || Math.random().toString(36).slice(2, 12);
     return `nav-${timestampLabel()}-${suffix}`;
-  }
-
-  function normalisedPageUrl(value = location.href) {
-    try {
-      const url = new URL(value, location.href);
-      url.search = "";
-      url.hash = "";
-      return url.href.replace(/\/$/, "");
-    } catch {
-      return String(value || "");
-    }
-  }
-
-  function textOf(node) {
-    return model.asText(node?.innerText || node?.textContent || "");
-  }
-
-  function attributeOf(node, names) {
-    for (const name of names) {
-      const value = node?.getAttribute?.(name);
-      if (value) return String(value);
-    }
-    return null;
-  }
-
-  function absoluteUrl(value) {
-    if (!String(value || "").trim()) return null;
-    try {
-      const url = new URL(value, location.href);
-      return url.protocol === "https:" ? url.href : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function firstText(node, candidateSelectors) {
-    for (const selector of candidateSelectors) {
-      const text = textOf(node?.querySelector?.(selector));
-      if (text) return text;
-    }
-    return "";
-  }
-
-  function subredditFromDocument() {
-    const parsed = model.parseRedditUrl(location.href);
-    if (parsed.subreddit) return parsed.subreddit;
-    for (const candidate of document.querySelectorAll('a[href^="/r/"], a[href^="https://www.reddit.com/r/"]')) {
-      const matched = model.parseRedditUrl(candidate.href);
-      if (matched.subreddit) return matched.subreddit;
-    }
-    return null;
-  }
-
-  function currentContext() {
-    const parsed = model.parseRedditUrl(location.href);
-    const subreddit = parsed.subreddit || subredditFromDocument();
-    const canonicalPostUrl = parsed.postId ? model.canonicalPostUrl(location.href, parsed.postId) : null;
-    return {
-      collection_id: "vr-xr",
-      collection_name: "VR-XR",
-      page_type: parsed.pageType,
-      subreddit,
-      source_url: normalisedPageUrl(location.href),
-      canonical_url: canonicalPostUrl || parsed.canonicalUrl || normalisedPageUrl(location.href),
-      post_id: parsed.postId || null,
-      post_fullname: parsed.postId ? model.fullname(parsed.postId, "t3") : null,
-      comment_id: parsed.commentId || null,
-      category: "manual"
-    };
-  }
-
-  function contextsMatch(left, right) {
-    return Boolean(left?.subreddit && right?.subreddit && left.subreddit.toLowerCase() === right.subreddit.toLowerCase());
-  }
-
-  function postContextsMatch(left, right) {
-    return Boolean(contextsMatch(left, right) && left?.post_fullname && right?.post_fullname
-      && left.post_fullname.toLowerCase() === right.post_fullname.toLowerCase());
-  }
-
-  function threadTargetContext(target, fallbackContext) {
-    const post = target?.post || {};
-    const postFullname = model.fullname(post.fullname || post.post_fullname || target?.post_fullname, "t3");
-    const canonicalUrl = model.postPermalinkForPost(
-      [target?.permalink, post.canonical_url, post.source_url, post.source_url_or_raw_path],
-      postFullname
-    );
-    if (!postFullname || !canonicalUrl) throw new Error("批量目标缺少可验证的帖子代码或永久链接。");
-    const parsed = model.parseRedditUrl(canonicalUrl);
-    return {
-      collection_id: "vr-xr",
-      collection_name: "VR-XR",
-      page_type: "thread",
-      subreddit: parsed.subreddit || post.subreddit || fallbackContext?.subreddit || null,
-      source_url: canonicalUrl,
-      canonical_url: canonicalUrl,
-      post_id: model.shortId(postFullname, "t3"),
-      post_fullname: postFullname,
-      comment_id: null,
-      category: fallbackContext?.category || "manual"
-    };
   }
 
   async function hydrate() {
@@ -532,293 +458,6 @@
     state.context = { ...state.context, ...context, subreddit: context.subreddit };
   }
 
-  function thingFullname(node, prefix) {
-    const values = [
-      attributeOf(node, ["id", "thingid", "data-fullname", "data-testid", "post-id", "comment-id"]),
-      node?.id
-    ];
-    for (const value of values) {
-      const exact = model.fullname(value, prefix);
-      if (exact) return exact;
-      const match = String(value || "").match(new RegExp(`(${prefix}_[A-Za-z0-9]+)`, "i"));
-      if (match) return model.fullname(match[1], prefix);
-    }
-    for (const link of node?.querySelectorAll?.('a[href*="/comments/"]') || []) {
-      const parsed = model.parseRedditUrl(link.href);
-      const candidate = prefix === "t3" ? parsed.postId : parsed.commentId;
-      const exact = model.fullname(candidate, prefix);
-      if (exact) return exact;
-    }
-    return null;
-  }
-
-  function findAuthor(node) {
-    const authorLink = node?.querySelector?.('a[href^="/user/"], a[href^="/u/"], a[href*="reddit.com/user/"], a[href*="reddit.com/u/"]');
-    const author = model.asText(attributeOf(node, ["author", "data-author"]) || textOf(authorLink));
-    return { author: author || null, authorUrl: absoluteUrl(authorLink?.href) };
-  }
-
-  function findTimestamp(node) {
-    const time = node?.querySelector?.("time[datetime]");
-    return time?.getAttribute("datetime") || attributeOf(node, ["created-timestamp", "created", "data-created-at"]) || null;
-  }
-
-  function findAttachments(node) {
-    const values = new Set();
-    for (const selector of ['a[href^="https://preview.redd.it/"]', 'a[href^="https://i.redd.it/"]', "img[src]", "video[src]", "source[src]"]) {
-      for (const element of node?.querySelectorAll?.(selector) || []) {
-        const candidate = absoluteUrl(element.href || element.currentSrc || element.src);
-        if (candidate) values.add(candidate);
-      }
-    }
-    return [...values].slice(0, 20);
-  }
-
-  function findScore(node) {
-    const raw = attributeOf(node, ["score", "data-score"])
-      || firstText(node, ['[slot="score"]', '[data-testid="post-score"]', '[data-testid="comment-score"]']);
-    const match = String(raw || "").replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
-    return match ? Number(match[0]) : null;
-  }
-
-  function localPostPermalinkCandidates(node) {
-    return [
-      attributeOf(node, ["permalink", "content-href", "data-permalink", "href"]),
-      ...[...(node?.querySelectorAll?.('a[href*="/comments/"]') || [])].map((link) => link.href)
-    ].filter(Boolean);
-  }
-
-  function postPermalink(node, context, postFullname) {
-    return model.postPermalinkForPost(localPostPermalinkCandidates(node), postFullname, context?.post_fullname === postFullname ? context.canonical_url : null);
-  }
-
-  function postTitle(node, postFullname) {
-    const title = attributeOf(node, ["post-title", "data-post-title"]);
-    if (title) return title;
-    const expectedPostId = model.shortId(postFullname, "t3");
-    for (const link of node?.querySelectorAll?.('a[href*="/comments/"]') || []) {
-      const parsed = model.parseRedditUrl(link.href);
-      if (!expectedPostId || parsed.postId?.toLowerCase() !== expectedPostId) continue;
-      const linkedTitle = model.asText(attributeOf(link, ["aria-label", "title"]) || textOf(link))
-        .replace(/^list item post\s*-\s*/i, "");
-      if (linkedTitle) return linkedTitle;
-    }
-    return firstText(node, selectors.postTitle);
-  }
-
-  function extractPostRecord(node, context) {
-    const postFullname = thingFullname(node, "t3") || context.post_fullname;
-    if (!postFullname) return null;
-    const author = findAuthor(node);
-    const title = postTitle(node, postFullname);
-    return model.makePostRecord({
-      fullname: postFullname,
-      subreddit: context.subreddit,
-      title,
-      content: firstText(node, selectors.postContent),
-      canonicalUrl: postPermalink(node, context, postFullname),
-      author: author.author,
-      authorUrl: author.authorUrl,
-      publishedAt: findTimestamp(node),
-      updatedAt: attributeOf(node, ["edited-timestamp", "updated-timestamp"]) || null,
-      edited: Boolean(attributeOf(node, ["edited", "data-edited"])) || /\bedited\b/i.test(textOf(node?.querySelector?.('[data-testid*="edited"]'))),
-      attachments: findAttachments(node),
-      score: findScore(node),
-      capturedAt: model.nowIso()
-    });
-  }
-
-  function postFallbackRecord(context) {
-    if (!context.post_fullname) return null;
-    const documentNode = document.documentElement;
-    const author = findAuthor(documentNode);
-    return model.makePostRecord({
-      fullname: context.post_fullname,
-      subreddit: context.subreddit,
-      title: firstText(document, ["h1", '[data-testid="post-title"]', 'shreddit-post [slot="title"]']),
-      content: firstText(document, ["shreddit-post-text-body", '[data-testid="post-content"]', '[data-click-id="text"]']),
-      canonicalUrl: model.canonicalPostUrl(context.canonical_url, context.post_fullname),
-      author: author.author,
-      authorUrl: author.authorUrl,
-      publishedAt: findTimestamp(documentNode),
-      attachments: findAttachments(documentNode),
-      capturedAt: model.nowIso()
-    });
-  }
-
-  function postNodes() {
-    const nodes = new Set();
-    for (const selector of selectors.postNodes) {
-      for (const node of document.querySelectorAll(selector)) nodes.add(node);
-    }
-    return [...nodes];
-  }
-
-  function parentFullnameForComment(node, commentFullname) {
-    const raw = attributeOf(node, selectors.commentParentAttributes);
-    if (raw) {
-      const parent = /^t1_/i.test(raw) ? model.fullname(raw, "t1") : /^t3_/i.test(raw) ? model.fullname(raw, "t3") : null;
-      if (parent && parent !== commentFullname) return parent;
-    }
-    return null;
-  }
-
-  function declaredCommentDepth(node) {
-    const raw = attributeOf(node, ["depth", "data-depth", "nesting-level"]);
-    if (raw == null) return null;
-    const numericDepth = Number(raw);
-    if (Number.isInteger(numericDepth) && numericDepth >= 0) return numericDepth;
-    return null;
-  }
-
-  function commentDepth(node, parentFullname) {
-    const declared = declaredCommentDepth(node);
-    if (declared != null) return declared;
-    if (!parentFullname) return null;
-    return parentFullname.startsWith("t1_") ? 1 : 0;
-  }
-
-  function commentPermalink(node, commentFullname) {
-    const shortCommentId = model.shortId(commentFullname, "t1");
-    for (const link of node?.querySelectorAll?.('a[href*="/comments/"]') || []) {
-      const parsed = model.parseRedditUrl(link.href);
-      if (parsed.commentId && parsed.commentId.toLowerCase() === shortCommentId) return parsed.canonicalUrl || absoluteUrl(link.href);
-    }
-    return null;
-  }
-
-  function commentOwnershipEvidence(node, context, commentFullname) {
-    const permalink = commentPermalink(node, commentFullname);
-    if (permalink) {
-      const parsed = model.parseRedditUrl(permalink);
-      if (parsed.postId && parsed.commentId
-        && model.fullname(parsed.postId, "t3") === context.post_fullname
-        && model.fullname(parsed.commentId, "t1") === commentFullname) {
-        return { method: "comment_permalink", canonicalUrl: permalink };
-      }
-    }
-    const owner = model.fullname(attributeOf(node, selectors.commentPostAttributes), "t3");
-    if (owner && owner === context.post_fullname) {
-      return { method: "comment_post_attribute", canonicalUrl: context.canonical_url };
-    }
-    return null;
-  }
-
-  function extractCommentRecord(node, context, nativeParentFullname = null, unknownParentReason = null) {
-    const commentFullname = thingFullname(node, "t1");
-    const postFullname = context.post_fullname || model.fullname(context.post_id, "t3");
-    if (!commentFullname || !postFullname) return null;
-    const ownership = commentOwnershipEvidence(node, context, commentFullname);
-    if (!ownership) return null;
-    const attributeParentFullname = parentFullnameForComment(node, commentFullname);
-    const parentFullname = attributeParentFullname
-      || nativeParentFullname
-      || (declaredCommentDepth(node) === 0 ? postFullname : null);
-    const parentReason = attributeParentFullname || declaredCommentDepth(node) === 0
-      ? "verified_attribute"
-      : nativeParentFullname
-        ? "verified_native_position"
-        : unknownParentReason || "parent_id_unavailable";
-    const author = findAuthor(node);
-    return model.makeCommentRecord({
-      fullname: commentFullname,
-      postFullname,
-      parentFullname,
-      parentReason,
-      depth: commentDepth(node, parentFullname),
-      subreddit: context.subreddit,
-      title: "",
-      content: firstText(node, selectors.commentContent),
-      canonicalUrl: ownership.canonicalUrl,
-      ownershipVerified: true,
-      ownershipMethod: ownership.method,
-      author: author.author,
-      authorUrl: author.authorUrl,
-      publishedAt: findTimestamp(node),
-      updatedAt: attributeOf(node, ["edited-timestamp", "updated-timestamp"]) || null,
-      edited: Boolean(attributeOf(node, ["edited", "data-edited"])) || /\bedited\b/i.test(textOf(node?.querySelector?.('[data-testid*="edited"]'))),
-      attachments: findAttachments(node),
-      score: findScore(node),
-      capturedAt: model.nowIso()
-    });
-  }
-
-  function nativeCommentNodes() {
-    return [...document.querySelectorAll("shreddit-comment")];
-  }
-
-  function commentNodes() {
-    // 新版 Reddit 的原生评论主机最可靠：广告卡和其他旁路组件不会拥有它。
-    // 旧布局没有该节点时，才退回兼容选择器。
-    const native = nativeCommentNodes();
-    if (native.length) return native;
-    const nodes = new Set();
-    for (const selector of selectors.commentNodes) {
-      for (const node of document.querySelectorAll(selector)) nodes.add(node);
-    }
-    return [...nodes];
-  }
-
-  function nativeCommentParentHints(nodes, collapsedPlaceholderCount = 0) {
-    const descriptors = (nodes || []).map((node) => ({
-      fullname: thingFullname(node, "t1"),
-      parentPositions: attributeOf(node, ["comment-parent-positions"]),
-      commentPosition: attributeOf(node, ["comment-position"]),
-      placeholderText: model.asText(`${textOf(node)} ${attributeOf(node, ["aria-label", "title"]) || ""}`)
-    }));
-    const evidence = model.diagnoseNativeCommentTree(descriptors, { collapsedPlaceholderCount });
-    return {
-      parents: model.resolveNativeCommentParents(descriptors),
-      parentReasons: evidence.parentReasons,
-      treeDiagnostics: evidence.treeDiagnostics
-    };
-  }
-
-  function collectListing(context) {
-    const records = [];
-    const invalid = [];
-    for (const node of postNodes()) {
-      const record = extractPostRecord(node, context);
-      if (!record) continue;
-      const reason = model.postPermalinkIssue(record.canonical_url, record.fullname, context.subreddit);
-      if (reason) {
-        invalid.push({ fullname: record.fullname, title: record.title || "", reason });
-      } else {
-        records.push(record);
-      }
-    }
-    const merged = mergeListingRecords([], records);
-    return {
-      records: merged,
-      invalid_permalinks: [...new Map(invalid.map((item) => [`${item.fullname}:${item.reason}`, item])).values()]
-    };
-  }
-
-  function collectThread(context, { collapsedPlaceholderCount = 0 } = {}) {
-    const post = postNodes()
-      .map((node) => extractPostRecord(node, context))
-      .find((record) => record?.fullname === context.post_fullname) || postFallbackRecord(context);
-    const nativeNodes = nativeCommentNodes();
-    const candidates = nativeNodes.length ? nativeNodes : commentNodes();
-    const parentHints = nativeCommentParentHints(candidates, collapsedPlaceholderCount);
-    const comments = candidates.map((node, index) => extractCommentRecord(
-      node,
-      context,
-      parentHints.parents.get(index) || null,
-      parentHints.parentReasons.get(index) || null
-    )).filter(Boolean);
-    const nativeCommentFullnames = nativeNodes.length
-      ? [...new Set(nativeNodes.map((node) => thingFullname(node, "t1")).filter(Boolean))]
-      : null;
-    return {
-      records: model.mergeRecords([post, ...comments].filter(Boolean)),
-      rejected_foreign_comment_count: Math.max(0, candidates.length - comments.length),
-      native_comment_fullnames: nativeCommentFullnames,
-      native_comment_node_count: nativeNodes.length,
-      tree_diagnostics: parentHints.treeDiagnostics
-    };
-  }
-
   function mergeIntoState(records, expectedPostFullname = null) {
     const merged = model.mergeRecords([...state.records, ...(records || [])]);
     if (!expectedPostFullname) {
@@ -925,16 +564,6 @@
       ? Math.max(effectiveTarget, Math.min(500, Number.isFinite(requestedCandidateLimit) && requestedCandidateLimit > 0 ? Math.floor(requestedCandidateLimit) : 500))
       : maxPosts;
     return { targetPostCount, maxPosts, effectiveTarget, skipExisting, candidatePostLimit };
-  }
-
-  function mergeListingRecords(existing, incoming, limit = Number.POSITIVE_INFINITY) {
-    const byFullname = new Map();
-    for (const record of [...(existing || []), ...(incoming || [])]) {
-      if (record?.record_type !== "post" || !record.fullname) continue;
-      const current = byFullname.get(record.fullname);
-      byFullname.set(record.fullname, current ? model.mergeRecords([current, record])[0] : record);
-    }
-    return [...byFullname.values()].slice(0, Math.max(1, limit));
   }
 
   function limitListingRecords(records, limit) {
@@ -2339,41 +1968,42 @@
     };
   }
 
+  const commandRegistry = commandRegistryModule.create([
+    ["probe", () => probe()],
+    ["captureListing", (message) => captureListing(message.config || {})],
+    ["runListing", (message) => runListing(message.config || {})],
+    ["captureThread", (message) => startThreadJob(message.config || {}), { captureFailure: true }],
+    ["resumeThread", () => resumeThreadJob(), { captureFailure: true }],
+    ["listThreadTargets", () => listThreadTargets()],
+    ["syncAndStartBatch", (message) => syncAndStartBatch(message.config || {}), { captureFailure: true }],
+    ["prepareControlPage", (message) => prepareControlPage(message)],
+    ["runControlledBatch", (message) => runControlledBatch(message), { captureFailure: true }],
+    ["retryUnfinishedBatch", (message) => retryUnfinishedBatch(message), { captureFailure: true }],
+    ["pauseControlledBatch", (message) => pauseControlledBatch(message)],
+    ["resumeControlledBatch", (message) => resumeControlledBatch(message), { captureFailure: true }],
+    ["cancelControlledBatch", (message) => cancelControlledBatch(message)],
+    ["repairCancelledBatch", () => repairCancelledBatchManifest()],
+    ["startLatestListingBatch", (message) => startLatestListingBatch(message.config || {}), { captureFailure: true }],
+    ["startBatch", (message) => startBatch(message.config || {}, message.selectedFullnames), { captureFailure: true }],
+    ["pauseBatch", () => pauseBatch()],
+    ["cancelBatch", () => cancelBatch()],
+    ["resumeBatch", () => resumeBatch(), { captureFailure: true }],
+    ["status", () => status()],
+    ["clearLocal", () => clearLocalState()]
+  ]);
+
   commandMessageListener = (message, _sender, sendResponse) => {
     if (disposed) return undefined;
     commandResponsePending = true;
     (async () => {
       await ready;
-      switch (message?.command) {
-        case "probe": return probe();
-        case "captureListing": return captureListing(message.config || {});
-        case "runListing": return runListing(message.config || {});
-        case "captureThread": return startThreadJob(message.config || {});
-        case "resumeThread": return resumeThreadJob();
-        case "listThreadTargets": return listThreadTargets();
-        case "syncAndStartBatch": return syncAndStartBatch(message.config || {});
-        case "prepareControlPage": return prepareControlPage(message);
-        case "runControlledBatch": return runControlledBatch(message);
-        case "retryUnfinishedBatch": return retryUnfinishedBatch(message);
-        case "pauseControlledBatch": return pauseControlledBatch(message);
-        case "resumeControlledBatch": return resumeControlledBatch(message);
-        case "cancelControlledBatch": return cancelControlledBatch(message);
-        case "repairCancelledBatch": return repairCancelledBatchManifest();
-        case "startLatestListingBatch": return startLatestListingBatch(message.config || {});
-        case "startBatch": return startBatch(message.config || {}, message.selectedFullnames);
-        case "pauseBatch": return pauseBatch();
-        case "cancelBatch": return cancelBatch();
-        case "resumeBatch": return resumeBatch();
-        case "status": return status();
-        case "clearLocal": return clearLocalState();
-        default: return { ok: false, code: "UNKNOWN_COMMAND", error: "未知 Reddit RPA 命令。" };
-      }
+      return commandRegistry.execute(message);
     })().then((result) => {
       sendResponse(result);
       commandResponsePending = false;
       flushDeferredThreadNavigation();
     }).catch(async (error) => {
-      const captureCommand = ["captureThread", "resumeThread", "syncAndStartBatch", "runControlledBatch", "retryUnfinishedBatch", "startLatestListingBatch", "startBatch", "resumeBatch", "resumeControlledBatch"].includes(message?.command);
+      const captureCommand = commandRegistry.capturesFailure(message);
       const result = captureCommand
         ? await recordThreadError(error).catch(() => ({ ok: false, code: "CAPTURE_FAILED", error: String(error?.message || error) }))
         : { ok: false, code: "CAPTURE_FAILED", error: String(error?.message || error) };

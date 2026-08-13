@@ -16,7 +16,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.reddit.com/*", "https://reddit.com/*"],
-      "js": ["reddit-dom-selectors.js", "reddit-model.js", "batch-queue.js", "listing-selection.js", "content.js"],
+      "js": ["collector-config.js", "reddit-dom-selectors.js", "reddit-model.js", "batch-queue.js", "listing-selection.js", "content-page-context.js", "content-record-extractor.js", "content-command-registry.js", "content.js"],
       "run_at": "document_idle"
     }
   ]

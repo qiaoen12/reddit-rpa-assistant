@@ -25,13 +25,29 @@ flowchart LR
 
 | 组件 | 主要文件 | 允许做的事 | 明确不负责的事 |
 | --- | --- | --- | --- |
-| 扩展 UI | popup.html、popup.js、popup.css | 启动同步/采集、显示批次状态、请求目录授权 | 直接解析全页 DOM、调用 Reddit 网络接口 |
-| 内容脚本 | content.js、reddit-model.js、reddit-dom-selectors.js | 读取当前页面已渲染节点、展开控件、证明 Post/Comment 归属、提交结构化消息 | 直接写任意本地路径、读取凭据、并行控制多个工作页 |
-| 后台 Service Worker | service-worker.js、batch-queue.js | 单工作页锁、队列、导航租约、重试、权限预检、写入路由、Native Host 桥接 | 通过 fetch 访问 Reddit API、读取错误页正文、猜测缺失评论 |
+| 扩展 UI | popup.html、popup.js、popup.css、collector-config.js | 启动同步/采集、显示批次状态、请求目录授权 | 直接解析全页 DOM、调用 Reddit 网络接口 |
+| 内容脚本 | content.js、collector-config.js、content-page-context.js、content-record-extractor.js、content-command-registry.js、reddit-model.js、reddit-dom-selectors.js | 读取当前页面已渲染节点、展开控件、证明 Post/Comment 归属、提交结构化消息 | 直接写任意本地路径、读取凭据、并行控制多个工作页 |
+| 后台 Service Worker | service-worker.js、native-host-client.mjs、navigation-lease.mjs、batch-event-contract.mjs、batch-queue.js | 单工作页锁、队列、导航租约、重试、权限预检、写入路由、Native Host 桥接 | 通过 fetch 访问 Reddit API、读取错误页正文、猜测缺失评论 |
 | 浏览器回退写入 | output-store.js、output-paths.mjs、post-storage.mjs | 使用用户授予的目录句柄、校验安全目录名、原子落盘 | 选择用户未授权的目录、访问冻结层 |
 | Native Host | native-host/reddit_rpa_native_host.py | 校验请求、固定集合根目录、原子写入、维护控制信箱 | 接收任意扩展传入的路径、打开网页、启动 HTTP 服务 |
 | 控制面 | scripts/reddit_rpa_control.py、scripts/reddit_rpa_mcp.py | 读取心跳/状态、写入结构化控制请求、返回结构化错误 | 直接驱动 DOM、改写帖子/评论或伪造完成状态 |
 | 离线处理 | scripts/*.py 中的合并/翻译/质量脚本 | 显式输入到显式输出、保留来源 ID/永久链接 | 联网采集、修改 raw/（迁移脚本除外且需显式确认） |
+
+### 2.1 细化模块边界
+
+`collector-config.js` 是 classic content script 与 popup 都能加载的只读默认参数契约。因为 content script 不能直接复用 ES module 导出，它用受控的 `globalThis.RedditRpaCollectorConfig` 暴露；该全局只包含冻结的默认值，不读取页面/Chrome 状态。内容脚本和 Service Worker 仍分别对跨边界传入的超时、冷却等参数做范围校验，这是刻意保留的防御性重复校验。
+
+`content-command-registry.js` 只维护“命令名 → 处理器 → 是否需要采集失败审计”的声明式登记表，不读取 DOM、不访问 Chrome API，也不持有采集状态。`content.js` 保留生命周期、DOM 采集和批次状态机。这样新增命令只需在一个登记表中声明其处理器和失败语义，避免分派 `switch` 与错误处理名单发生漂移。
+
+`content-page-context.js` 把 URL 规范化、当前页面上下文、批量目标上下文与轻量 DOM 取值规则集中为可注入的纯工厂。它不持有采集状态、不调用 Chrome API；`content.js` 仅在启动时注入页面依赖并继续负责 DOM 遍历和生命周期。这使页面身份规则能独立测试，也避免同一 URL 语义散落在采集状态机中。
+
+`content-record-extractor.js` 只把页面上已渲染的 DOM 节点转换成 Post/Comment 记录，并在输出前验证 fullname、永久链接、评论归属与父级证据。它不读写扩展状态、不调度导航；`content.js` 继续决定何时展开、重试、持久化或推进批次。因此 DOM 演进可以在单一模块和夹具测试中审计，不会混入批次编排。
+
+`native-host-client.mjs` 只负责 Native Messaging 连接复用、请求 ID 关联、超时和断连回收；Service Worker 仍决定何时调用 Host、如何解释业务响应及何时回退到 File System Access。这样本机高权限传输与采集编排的审计边界保持清晰。
+
+`navigation-lease.mjs` 只维护可单测的导航规则：租约 ID/Post ID 校验、超时范围、浏览器错误页的低归因失败分类，以及失败事件/审计记录的字段组装。它不访问 `chrome`、不写存储，也不决定暂停、重试或落盘；这些副作用仍由 `service-worker.js` 编排。
+
+`batch-event-contract.mjs` 只定义批次事件可接受的字段、枚举值与归一化结果。Worker 和 Native Host 在各自信任边界都继续执行独立校验；此模块只让 Worker 侧的 schema 演进和单元测试有一个明确入口。
 
 ## 3. 批次控制时序
 

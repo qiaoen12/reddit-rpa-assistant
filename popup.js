@@ -1,17 +1,13 @@
+import "./collector-config.js";
 import {
   requestOutputRootPermission,
   saveOutputRoot,
   validateCollectionDataRoot
 } from "./output-store.js";
 
-const DEFAULT_CONFIG = Object.freeze({
-  listingSteps: 25,
-  targetPostCount: 25,
-  maxPosts: 25,
-  scrollPercent: 85,
-  waitMs: 1500,
-  expansionPasses: 10
-});
+const collectorConfig = globalThis.RedditRpaCollectorConfig;
+if (!collectorConfig?.DEFAULT_CONFIG) throw new Error("Reddit RPA 默认采集配置未加载。");
+const { DEFAULT_CONFIG } = collectorConfig;
 
 const ACTION_BUTTONS = [
   "chooseOutputRoot", "reconnectOutputRoot", "probe", "captureListing", "runListing",

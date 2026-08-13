@@ -148,6 +148,20 @@ async function startLease(worker) {
   });
 }
 
+test("validates a batch event before sending it to the Native Host", async () => {
+  const worker = await runtime();
+  const response = await worker.send({
+    type: "reddit-rpa-store-batch-event",
+    worker_token: "worker-1",
+    event: { batch_id: "batch-1", seq: 1, event: "not_an_event" }
+  });
+
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "BATCH_EVENT_INVALID");
+  assert.equal(worker.operations.length, 0, "invalid events must not cross the Native Messaging boundary");
+  delete globalThis.chrome;
+});
+
 test("records an observed HTTP 429 error page without claiming a verified Reddit origin", async () => {
   const worker = await runtime();
   const started = await startLease(worker);
@@ -161,6 +175,7 @@ test("records an observed HTTP 429 error page without claiming a verified Reddit
   assert.equal(batch.rate_limit.evidence_source, "tab_metadata");
   assert.equal(batch.rate_limit.displayed_http_status, 429);
   assert.equal(batch.current.last_failure.failure_kind, "HTTP_429_ERROR_PAGE_OBSERVED");
+  assert.equal(batch.event_seq, 2, "Worker must persist the sequence after the pure event builder returns");
   assert.equal(worker.local.values[LEASE_KEY], undefined, "a classified navigation must not remain silently pending");
   const event = worker.operations.find((operation) => operation.operation === "store_batch_event").payload.event;
   assert.equal(event.event, "navigation_error_observed");

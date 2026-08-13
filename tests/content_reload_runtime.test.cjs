@@ -5,10 +5,14 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const root = path.join(__dirname, "..");
+const collectorConfigSource = readFileSync(path.join(root, "collector-config.js"), "utf8");
 const selectorsSource = readFileSync(path.join(root, "reddit-dom-selectors.js"), "utf8");
 const modelSource = readFileSync(path.join(root, "reddit-model.js"), "utf8");
 const queueSource = readFileSync(path.join(root, "batch-queue.js"), "utf8");
 const listingSelectionSource = readFileSync(path.join(root, "listing-selection.js"), "utf8");
+const pageContextSource = readFileSync(path.join(root, "content-page-context.js"), "utf8");
+const recordExtractorSource = readFileSync(path.join(root, "content-record-extractor.js"), "utf8");
+const commandRegistrySource = readFileSync(path.join(root, "content-command-registry.js"), "utf8");
 const contentSource = readFileSync(path.join(root, "content.js"), "utf8");
 
 function createPageRuntime({ storageGetError = null } = {}) {
@@ -64,10 +68,14 @@ function createPageRuntime({ storageGetError = null } = {}) {
 }
 
 function injectCurrentScripts(runtime) {
+  vm.runInNewContext(collectorConfigSource, runtime.sandbox, { filename: "collector-config.js" });
   vm.runInNewContext(selectorsSource, runtime.sandbox, { filename: "reddit-dom-selectors.js" });
   vm.runInNewContext(modelSource, runtime.sandbox, { filename: "reddit-model.js" });
   vm.runInNewContext(queueSource, runtime.sandbox, { filename: "batch-queue.js" });
   vm.runInNewContext(listingSelectionSource, runtime.sandbox, { filename: "listing-selection.js" });
+  vm.runInNewContext(pageContextSource, runtime.sandbox, { filename: "content-page-context.js" });
+  vm.runInNewContext(recordExtractorSource, runtime.sandbox, { filename: "content-record-extractor.js" });
+  vm.runInNewContext(commandRegistrySource, runtime.sandbox, { filename: "content-command-registry.js" });
   vm.runInNewContext(contentSource, runtime.sandbox, { filename: "content.js" });
 }
 
@@ -75,14 +83,14 @@ function flushMicrotasks() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-test("takes over a page whose old extension script left the legacy loaded flag behind", async () => {
+test("takes over a page and clears the obsolete legacy loaded flag", async () => {
   const runtime = createPageRuntime();
   runtime.sandbox.__redditRpaContentScriptLoaded = true;
 
   injectCurrentScripts(runtime);
   await flushMicrotasks();
 
-  assert.equal(runtime.sandbox.__redditRpaContentScriptLoaded, "0.8.2");
+  assert.equal(runtime.sandbox.__redditRpaContentScriptLoaded, undefined);
   assert.equal(runtime.listeners.size, 1, "the current script must install a usable command listener");
   assert.equal(runtime.timers.size, 3, "the current script should retain its watcher, hydration timer and control poller");
 
